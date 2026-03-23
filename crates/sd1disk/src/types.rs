@@ -6,6 +6,7 @@ use crate::sysex::{MessageType, SysExPacket};
 const PROGRAM_NAME_OFFSET: usize = 498;
 const PROGRAM_NAME_LEN: usize = 11;
 const PROGRAM_SIZE: usize = 530;
+const SIXTY_PROGRAMS_COUNT: usize = 60;
 const PRESET_SIZE: usize = 48;
 
 pub struct Program([u8; PROGRAM_SIZE]);
@@ -135,6 +136,53 @@ impl Sequence {
     pub fn file_type(&self) -> FileType {
         FileType::OneSequence
     }
+}
+
+/// Convert AllPrograms SysEx payload (60 × 530 bytes, programs in order) to the
+/// SD-1 on-disk SixtyPrograms format, which byte-interleaves even- and odd-indexed programs.
+///
+/// File byte layout: even bytes = programs 0,2,4,...,58 concatenated;
+///                   odd bytes  = programs 1,3,5,...,59 concatenated.
+pub fn interleave_sixty_programs(payload: &[u8]) -> Result<Vec<u8>> {
+    let expected = SIXTY_PROGRAMS_COUNT * PROGRAM_SIZE;
+    if payload.len() != expected {
+        return Err(Error::InvalidSysEx("AllPrograms payload must be exactly 60 × 530 bytes"));
+    }
+    let even_data: Vec<u8> = (0..30)
+        .flat_map(|k| &payload[k * 2 * PROGRAM_SIZE..(k * 2 + 1) * PROGRAM_SIZE])
+        .copied()
+        .collect();
+    let odd_data: Vec<u8> = (0..30)
+        .flat_map(|k| &payload[(k * 2 + 1) * PROGRAM_SIZE..(k * 2 + 2) * PROGRAM_SIZE])
+        .copied()
+        .collect();
+    let mut result = vec![0u8; expected];
+    for i in 0..15900 {
+        result[2 * i]     = even_data[i];
+        result[2 * i + 1] = odd_data[i];
+    }
+    Ok(result)
+}
+
+/// Reverse of `interleave_sixty_programs`: convert on-disk SixtyPrograms data back
+/// to the AllPrograms SysEx payload order (programs 0,1,2,...,59 in sequence).
+pub fn deinterleave_sixty_programs(data: &[u8]) -> Result<Vec<u8>> {
+    let expected = SIXTY_PROGRAMS_COUNT * PROGRAM_SIZE;
+    if data.len() != expected {
+        return Err(Error::InvalidSysEx("SixtyPrograms disk data must be exactly 60 × 530 bytes"));
+    }
+    let even_data: Vec<u8> = data.iter().step_by(2).copied().collect();
+    let odd_data:  Vec<u8> = data.iter().skip(1).step_by(2).copied().collect();
+    let mut result = vec![0u8; expected];
+    for k in 0..30 {
+        let dst_even = k * 2 * PROGRAM_SIZE;
+        let dst_odd  = (k * 2 + 1) * PROGRAM_SIZE;
+        result[dst_even..dst_even + PROGRAM_SIZE]
+            .copy_from_slice(&even_data[k * PROGRAM_SIZE..(k + 1) * PROGRAM_SIZE]);
+        result[dst_odd..dst_odd + PROGRAM_SIZE]
+            .copy_from_slice(&odd_data[k * PROGRAM_SIZE..(k + 1) * PROGRAM_SIZE]);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

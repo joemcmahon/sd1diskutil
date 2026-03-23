@@ -14,4 +14,4 @@ pub mod sysex;
 pub use sysex::{MessageType, SysExPacket};
 
 pub mod types;
-pub use types::{Program, Preset, Sequence};
+pub use types::{Program, Preset, Sequence, interleave_sixty_programs, deinterleave_sixty_programs};
