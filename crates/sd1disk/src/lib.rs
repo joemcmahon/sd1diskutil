@@ -9,3 +9,6 @@ pub use fat::{FatEntry, FileAllocationTable};
 
 pub mod directory;
 pub use directory::{DirectoryEntry, FileType, SubDirectory, validate_name};
+
+pub mod sysex;
+pub use sysex::{MessageType, SysExPacket};
