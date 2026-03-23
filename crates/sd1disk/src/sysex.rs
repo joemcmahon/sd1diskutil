@@ -64,6 +64,7 @@ pub struct SysExPacket {
 }
 
 impl SysExPacket {
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 8 {
             return Err(Error::InvalidSysEx("packet too short"));

@@ -96,7 +96,10 @@ fn cmd_list(image_path: &Path) -> sd1disk::Result<()> {
             total += 1;
         }
     }
-    println!("\n{} file(s), {} free blocks", total, img.free_blocks());
+    let free_count = (23u16..1600)
+        .filter(|&b| sd1disk::FileAllocationTable::entry(&img, b) == sd1disk::FatEntry::Free)
+        .count();
+    println!("\n{} file(s), {} free blocks", total, free_count);
     Ok(())
 }
 
@@ -182,7 +185,7 @@ fn cmd_write(
         img.set_free_blocks(img.free_blocks() + freed);
     }
 
-    let n_blocks = ((data.len() + 511) / 512) as u16;
+    let n_blocks = data.len().div_ceil(512) as u16;
     let blocks = FileAllocationTable::allocate(&mut img, n_blocks)?;
 
     for (i, &block_num) in blocks.iter().enumerate() {
