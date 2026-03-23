@@ -93,11 +93,14 @@ impl DirectoryEntry {
 }
 
 /// Validate that a name fits in 11 bytes and is non-empty.
-pub fn validate_name(name: &str) -> Result<()> {
+/// Returns the name as a space-padded [u8; 11] array.
+pub fn validate_name(name: &str) -> Result<[u8; 11]> {
     if name.is_empty() || name.len() > 11 {
         return Err(Error::InvalidName(name.to_string()));
     }
-    Ok(())
+    let mut arr = [b' '; 11];
+    arr[..name.len()].copy_from_slice(name.as_bytes());
+    Ok(arr)
 }
 
 /// SubDirectory is a stateless handle — index 0..3.
@@ -182,7 +185,7 @@ impl SubDirectory {
     }
 
     pub fn add(&self, image: &mut DiskImage, entry: DirectoryEntry) -> Result<()> {
-        // Validate name fits in 11 bytes
+        // Validate name fits in 11 bytes; we use entry.name directly
         validate_name(entry.name_str().as_ref())?;
         // Find first free slot
         let slot = (0..SUBDIR_CAPACITY)
