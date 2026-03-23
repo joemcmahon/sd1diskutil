@@ -12,3 +12,6 @@ pub use directory::{DirectoryEntry, FileType, SubDirectory, validate_name};
 
 pub mod sysex;
 pub use sysex::{MessageType, SysExPacket};
+
+pub mod types;
+pub use types::{Program, Preset, Sequence};
