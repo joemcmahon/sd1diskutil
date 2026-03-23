@@ -14,6 +14,7 @@ fn make_test_program_packet(name_bytes_arr: &[u8; 11]) -> SysExPacket {
     SysExPacket {
         message_type: MessageType::OneProgram,
         midi_channel: 0,
+        model: 0,
         payload,
     }
 }

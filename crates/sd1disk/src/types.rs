@@ -50,6 +50,7 @@ impl Program {
         SysExPacket {
             message_type: MessageType::OneProgram,
             midi_channel: channel,
+            model: 0,
             payload: self.0.to_vec(),
         }
     }
@@ -94,6 +95,7 @@ impl Preset {
         SysExPacket {
             message_type: MessageType::OnePreset,
             midi_channel: channel,
+            model: 0,
             payload: self.0.to_vec(),
         }
     }
@@ -129,6 +131,7 @@ impl Sequence {
         SysExPacket {
             message_type: MessageType::SingleSequence,
             midi_channel: channel,
+            model: 0,
             payload: self.0.clone(),
         }
     }
@@ -196,6 +199,7 @@ mod tests {
         SysExPacket {
             message_type: MessageType::OneProgram,
             midi_channel: 0,
+            model: 0,
             payload,
         }
     }
@@ -204,6 +208,7 @@ mod tests {
         SysExPacket {
             message_type: MessageType::OnePreset,
             midi_channel: 0,
+            model: 0,
             payload: vec![0xAAu8; 48],
         }
     }
@@ -227,6 +232,7 @@ mod tests {
         let pkt = SysExPacket {
             message_type: MessageType::OnePreset,
             midi_channel: 0,
+            model: 0,
             payload: vec![0u8; 530],
         };
         assert!(matches!(Program::from_sysex(&pkt), Err(crate::Error::WrongMessageType { .. })));
@@ -237,6 +243,7 @@ mod tests {
         let pkt = SysExPacket {
             message_type: MessageType::OneProgram,
             midi_channel: 0,
+            model: 0,
             payload: vec![0u8; 100],
         };
         assert!(Program::from_sysex(&pkt).is_err());

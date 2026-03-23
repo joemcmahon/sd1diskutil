@@ -4,11 +4,12 @@ use crate::{Error, Result};
 const SYSEX_START: u8 = 0xF0;
 const ENSONIQ_CODE: u8 = 0x0F;
 const VFX_FAMILY: u8 = 0x05;
-const VFX_MODEL: u8 = 0x00;
 const SYSEX_END: u8 = 0xF7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageType {
+    Command,
+    Error,
     OneProgram,
     AllPrograms,
     OnePreset,
@@ -16,11 +17,14 @@ pub enum MessageType {
     SingleSequence,
     AllSequences,
     TrackParameters,
+    Unknown(u8),
 }
 
 impl MessageType {
-    fn from_byte(b: u8) -> Result<Self> {
-        Ok(match b {
+    fn from_byte(b: u8) -> Self {
+        match b {
+            0x00 => MessageType::Command,
+            0x01 => MessageType::Error,
             0x02 => MessageType::OneProgram,
             0x03 => MessageType::AllPrograms,
             0x04 => MessageType::OnePreset,
@@ -28,12 +32,14 @@ impl MessageType {
             0x09 => MessageType::SingleSequence,
             0x0A => MessageType::AllSequences,
             0x0B => MessageType::TrackParameters,
-            _other => return Err(Error::InvalidSysEx("unknown message type")),
-        })
+            other => MessageType::Unknown(other),
+        }
     }
 
     fn to_byte(&self) -> u8 {
         match self {
+            MessageType::Command         => 0x00,
+            MessageType::Error           => 0x01,
             MessageType::OneProgram      => 0x02,
             MessageType::AllPrograms     => 0x03,
             MessageType::OnePreset       => 0x04,
@@ -41,11 +47,14 @@ impl MessageType {
             MessageType::SingleSequence  => 0x09,
             MessageType::AllSequences    => 0x0A,
             MessageType::TrackParameters => 0x0B,
+            MessageType::Unknown(b)      => *b,
         }
     }
 
     pub fn display_name(&self) -> &'static str {
         match self {
+            MessageType::Command         => "Command",
+            MessageType::Error           => "Error",
             MessageType::OneProgram      => "OneProgram",
             MessageType::AllPrograms     => "AllPrograms",
             MessageType::OnePreset       => "OnePreset",
@@ -53,6 +62,7 @@ impl MessageType {
             MessageType::SingleSequence  => "SingleSequence",
             MessageType::AllSequences    => "AllSequences",
             MessageType::TrackParameters => "TrackParameters",
+            MessageType::Unknown(_)      => "Unknown",
         }
     }
 }
@@ -60,6 +70,7 @@ impl MessageType {
 pub struct SysExPacket {
     pub message_type: MessageType,
     pub midi_channel: u8,
+    pub model: u8,
     pub payload: Vec<u8>,
 }
 
@@ -81,17 +92,38 @@ impl SysExPacket {
         if bytes[2] != VFX_FAMILY {
             return Err(Error::InvalidSysEx("not a VFX family packet (expected 05)"));
         }
-        if bytes[3] != VFX_MODEL {
-            return Err(Error::InvalidSysEx("not a VFX model packet (expected 00)"));
-        }
+        let model = bytes[3];
         let midi_channel = bytes[4];
-        let message_type = MessageType::from_byte(bytes[5])?;
+        let message_type = MessageType::from_byte(bytes[5]);
         let nybbles = &bytes[6..bytes.len() - 1];
         if nybbles.len() % 2 != 0 {
             return Err(Error::InvalidSysEx("odd number of nybble bytes"));
         }
         let payload = denybblize(nybbles);
-        Ok(SysExPacket { message_type, midi_channel, payload })
+        Ok(SysExPacket { message_type, midi_channel, model, payload })
+    }
+
+    /// Parse a byte stream that may contain one or more concatenated SysEx packets.
+    /// Splits on F0/F7 boundaries and returns all valid packets.
+    pub fn parse_all(bytes: &[u8]) -> Result<Vec<SysExPacket>> {
+        let mut packets = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != SYSEX_START {
+                i += 1;
+                continue;
+            }
+            let end = match bytes[i..].iter().position(|&b| b == SYSEX_END) {
+                Some(pos) => i + pos,
+                None => return Err(Error::InvalidSysEx("unterminated SysEx packet")),
+            };
+            packets.push(SysExPacket::parse(&bytes[i..=end])?);
+            i = end + 1;
+        }
+        if packets.is_empty() {
+            return Err(Error::InvalidSysEx("no SysEx packets found"));
+        }
+        Ok(packets)
     }
 
     pub fn to_bytes(&self, channel: u8) -> Vec<u8> {
@@ -99,7 +131,7 @@ impl SysExPacket {
         out.push(SYSEX_START);
         out.push(ENSONIQ_CODE);
         out.push(VFX_FAMILY);
-        out.push(VFX_MODEL);
+        out.push(self.model);
         out.push(channel);
         out.push(self.message_type.to_byte());
         out.extend(nybblize(&self.payload));

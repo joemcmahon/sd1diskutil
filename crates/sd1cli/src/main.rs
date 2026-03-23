@@ -335,7 +335,7 @@ fn cmd_extract(
         }
         FileType::SixtyPrograms => {
             let payload = deinterleave_sixty_programs(&raw)?;
-            SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, payload }
+            SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, model: 0, payload }
                 .to_bytes(channel)
         }
         FileType::OneSequence | FileType::ThirtySequences | FileType::SixtySequences => {
@@ -377,55 +377,117 @@ fn cmd_create(image_path: &Path) -> sd1disk::Result<()> {
 
 fn cmd_inspect_sysex(sysex_path: &Path) -> sd1disk::Result<()> {
     let bytes = std::fs::read(sysex_path)?;
-    let packet = SysExPacket::parse(&bytes)?;
-    let payload = &packet.payload;
+    let packets = SysExPacket::parse_all(&bytes)?;
 
     println!("File:    {}", sysex_path.display());
-    println!("Type:    {}", packet.message_type.display_name());
-    println!("Channel: {}", packet.midi_channel);
-    println!("Payload: {} bytes", payload.len());
+    if packets.len() > 1 {
+        println!("Packets: {}", packets.len());
+    }
 
-    match &packet.message_type {
-        sd1disk::MessageType::OneProgram => {
-            let prog = Program::from_sysex(&packet)?;
-            println!("Name:    {}", prog.name());
-        }
-        sd1disk::MessageType::AllPrograms => {
-            let prog_size = 530usize;
-            let expected = 60 * prog_size;
-            if payload.len() != expected {
-                println!("WARNING: expected {} bytes (60 × 530), got {}", expected, payload.len());
-                return Ok(());
-            }
+    for (idx, packet) in packets.iter().enumerate() {
+        let payload = &packet.payload;
+        if packets.len() > 1 {
             println!();
-            println!("{:<4} {}", "SLOT", "NAME");
-            println!("{}", "-".repeat(20));
-            for i in 0..60 {
-                let name_bytes = &payload[i * prog_size + 498..i * prog_size + 509];
-                let name = name_bytes.iter()
-                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' })
-                    .collect::<String>();
-                let blank = name.trim().is_empty();
-                println!("{:<4} [{}]{}", i, name, if blank { "  <empty>" } else { "" });
+            println!("--- Packet {}: {} ---", idx + 1, packet.message_type.display_name());
+        }
+        println!("Type:    {}", packet.message_type.display_name());
+        println!("Channel: {}", packet.midi_channel);
+        println!("Payload: {} bytes", payload.len());
+
+        match &packet.message_type {
+            sd1disk::MessageType::OneProgram => {
+                let prog = Program::from_sysex(packet)?;
+                println!("Name:    {}", prog.name());
             }
-        }
-        sd1disk::MessageType::OnePreset => {
-            let preset = Preset::from_sysex(&packet)?;
-            let _ = preset;
-            println!("(preset data, {} bytes)", payload.len());
-        }
-        sd1disk::MessageType::AllPresets => {
-            let preset_size = 48usize;
-            let count = payload.len() / preset_size;
-            println!("Presets: {} × {} bytes", count, preset_size);
-        }
-        other => {
-            println!("Type byte: 0x{:02X}", match other {
-                sd1disk::MessageType::SingleSequence => 0x09,
-                sd1disk::MessageType::AllSequences   => 0x0A,
-                _                                    => 0xFF,
-            });
+            sd1disk::MessageType::AllPrograms => {
+                let prog_size = 530usize;
+                let expected = 60 * prog_size;
+                if payload.len() != expected {
+                    println!("WARNING: expected {} bytes (60 × 530), got {}", expected, payload.len());
+                    continue;
+                }
+                println!();
+                println!("{:<4} {}", "SLOT", "NAME");
+                println!("{}", "-".repeat(20));
+                for i in 0..60 {
+                    let name_bytes = &payload[i * prog_size + 498..i * prog_size + 509];
+                    let name = name_bytes.iter()
+                        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' })
+                        .collect::<String>();
+                    let blank = name.trim().is_empty();
+                    println!("{:<4} [{}]{}", i, name, if blank { "  <empty>" } else { "" });
+                }
+            }
+            sd1disk::MessageType::OnePreset => {
+                println!("(preset data, {} bytes)", payload.len());
+            }
+            sd1disk::MessageType::AllPresets => {
+                let preset_size = 48usize;
+                let count = payload.len() / preset_size;
+                println!("Presets: {} × {} bytes", count, preset_size);
+            }
+            sd1disk::MessageType::SingleSequence |
+            sd1disk::MessageType::AllSequences => {
+                println!("(sequence data, {} bytes)", payload.len());
+            }
+            sd1disk::MessageType::TrackParameters => {
+                println!("(track parameters, {} bytes)", payload.len());
+            }
+            sd1disk::MessageType::Command => {
+                print_command_payload(payload);
+            }
+            sd1disk::MessageType::Error => {
+                let code = payload.first().copied().unwrap_or(0xFF);
+                let name = match code {
+                    0x00 => "NAK",
+                    0x01 => "INVALID PARAMETER NUMBER",
+                    0x02 => "INVALID PARAMETER VALUE",
+                    0x03 => "INVALID BUTTON NUMBER",
+                    0x04 => "ACK",
+                    _    => "unknown error code",
+                };
+                println!("Error code 0x{:02X}: {}", code, name);
+            }
+            sd1disk::MessageType::Unknown(b) => {
+                println!("(unknown type 0x{:02X}, {} bytes)", b, payload.len());
+            }
         }
     }
     Ok(())
+}
+
+fn print_command_payload(payload: &[u8]) {
+    let cmd = payload.first().copied().unwrap_or(0xFF);
+    let (name, extra) = match cmd {
+        0x00 => ("VirtualButtons", None),
+        0x01 => ("ParameterChange", None),
+        0x02 => ("EditChangeStatus", None),
+        0x03 => ("ESPMicrocodeLoad", None),
+        0x04 => ("PokeByteToRAM", None),
+        0x05 => ("SingleProgramDumpRequest", None),
+        0x06 => ("SinglePresetDumpRequest", None),
+        0x07 => ("TrackParameterDumpRequest", None),
+        0x08 => ("DumpEverythingRequest", None),
+        0x09 => ("InternalProgramBankDumpRequest", None),
+        0x0A => ("InternalPresetBankDumpRequest", None),
+        0x0B | 0x0C => {
+            let name = if cmd == 0x0B { "SingleSequenceDump" } else { "AllSequenceMemoryDump" };
+            let size = if payload.len() >= 5 {
+                ((payload[1] as u32) << 24)
+                    | ((payload[2] as u32) << 16)
+                    | ((payload[3] as u32) << 8)
+                    | (payload[4] as u32)
+            } else {
+                0
+            };
+            (name, Some(format!("sequence data size = {} bytes", size)))
+        }
+        0x0D => ("SingleSequenceDumpRequest", None),
+        0x0E => ("AllSequenceDumpRequest", None),
+        _    => ("unknown command", None),
+    };
+    match extra {
+        Some(detail) => println!("Command 0x{:02X}: {} ({})", cmd, name, detail),
+        None         => println!("Command 0x{:02X}: {}", cmd, name),
+    }
 }
