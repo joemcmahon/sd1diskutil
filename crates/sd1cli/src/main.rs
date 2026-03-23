@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
-    validate_name, DirectoryEntry, FileType,
+    validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -127,6 +127,18 @@ The image can be written to a floppy disk with a tool such as `dd`.")]
         /// Path where the new disk image will be written
         image: PathBuf,
     },
+    /// Parse and display contents of a SysEx file
+    #[command(name = "inspect-sysex", long_about = "\
+Parse a SysEx (.syx) file and display its contents.
+
+For AllPrograms: lists all 60 program names and their slot numbers.
+For OneProgram: shows the program name and payload size.
+For AllPresets: lists all preset names.
+For other types: shows message type and payload size.")]
+    InspectSysex {
+        /// Path to the SysEx (.syx) file
+        sysex: PathBuf,
+    },
 }
 
 fn main() {
@@ -147,6 +159,7 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
             cmd_extract(&image, &name, out.as_deref(), channel),
         Command::Delete { image, name } => cmd_delete(&image, &name),
         Command::Create { image } => cmd_create(&image),
+        Command::InspectSysex { sysex } => cmd_inspect_sysex(&sysex),
     }
 }
 
@@ -213,7 +226,7 @@ fn cmd_write(
             (prog.to_bytes().to_vec(), FileType::OneProgram)
         }
         sd1disk::MessageType::AllPrograms => {
-            (packet.payload.clone(), FileType::SixtyPrograms)
+            (sd1disk::interleave_sixty_programs(&packet.payload)?, FileType::SixtyPrograms)
         }
         sd1disk::MessageType::OnePreset => {
             let preset = Preset::from_sysex(&packet)?;
@@ -320,6 +333,11 @@ fn cmd_extract(
         FileType::OnePreset => {
             Preset::from_bytes(&raw)?.to_sysex(channel).to_bytes(channel)
         }
+        FileType::SixtyPrograms => {
+            let payload = deinterleave_sixty_programs(&raw)?;
+            SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, payload }
+                .to_bytes(channel)
+        }
         FileType::OneSequence | FileType::ThirtySequences | FileType::SixtySequences => {
             Sequence::from_bytes(&raw).to_sysex(channel).to_bytes(channel)
         }
@@ -354,5 +372,60 @@ fn cmd_create(image_path: &Path) -> sd1disk::Result<()> {
     let img = DiskImage::create();
     img.save(image_path)?;
     println!("Created blank disk image: {}", image_path.display());
+    Ok(())
+}
+
+fn cmd_inspect_sysex(sysex_path: &Path) -> sd1disk::Result<()> {
+    let bytes = std::fs::read(sysex_path)?;
+    let packet = SysExPacket::parse(&bytes)?;
+    let payload = &packet.payload;
+
+    println!("File:    {}", sysex_path.display());
+    println!("Type:    {}", packet.message_type.display_name());
+    println!("Channel: {}", packet.midi_channel);
+    println!("Payload: {} bytes", payload.len());
+
+    match &packet.message_type {
+        sd1disk::MessageType::OneProgram => {
+            let prog = Program::from_sysex(&packet)?;
+            println!("Name:    {}", prog.name());
+        }
+        sd1disk::MessageType::AllPrograms => {
+            let prog_size = 530usize;
+            let expected = 60 * prog_size;
+            if payload.len() != expected {
+                println!("WARNING: expected {} bytes (60 × 530), got {}", expected, payload.len());
+                return Ok(());
+            }
+            println!();
+            println!("{:<4} {}", "SLOT", "NAME");
+            println!("{}", "-".repeat(20));
+            for i in 0..60 {
+                let name_bytes = &payload[i * prog_size + 498..i * prog_size + 509];
+                let name = name_bytes.iter()
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' })
+                    .collect::<String>();
+                let blank = name.trim().is_empty();
+                println!("{:<4} [{}]{}", i, name, if blank { "  <empty>" } else { "" });
+            }
+        }
+        sd1disk::MessageType::OnePreset => {
+            let preset = Preset::from_sysex(&packet)?;
+            let _ = preset;
+            println!("(preset data, {} bytes)", payload.len());
+        }
+        sd1disk::MessageType::AllPresets => {
+            let preset_size = 48usize;
+            let count = payload.len() / preset_size;
+            println!("Presets: {} × {} bytes", count, preset_size);
+        }
+        other => {
+            println!("Type byte: 0x{:02X}", match other {
+                sd1disk::MessageType::SingleSequence => 0x09,
+                sd1disk::MessageType::AllSequences   => 0x0A,
+                _                                    => 0xFF,
+            });
+        }
+    }
     Ok(())
 }
