@@ -233,12 +233,12 @@ fn cmd_write(
     };
 
     let resolved_name = if let Some(n) = name_override {
-        n.to_string()
+        n.to_uppercase()
     } else {
         sysex_path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("UNNAMED")
-            .to_string()
+            .to_uppercase()
     };
 
     let name_arr = validate_name(&resolved_name)?;
