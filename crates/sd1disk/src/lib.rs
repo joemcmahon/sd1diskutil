@@ -1,1 +1,2 @@
-// (empty for now — modules added as we go)
+pub mod error;
+pub use error::{Error, Result};
