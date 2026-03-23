@@ -6,3 +6,6 @@ pub use image::DiskImage;
 
 pub mod fat;
 pub use fat::{FatEntry, FileAllocationTable};
+
+pub mod directory;
+pub use directory::{DirectoryEntry, FileType, SubDirectory, validate_name};
