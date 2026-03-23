@@ -8,7 +8,20 @@ use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "sd1disk", about = "Ensoniq SD-1 disk image utility")]
+#[command(
+    name = "sd1cli",
+    about = "Ensoniq SD-1 disk image utility",
+    long_about = "\
+Ensoniq SD-1 disk image utility
+
+Manage Ensoniq SD-1 synthesizer disk images (.img). Supports reading, writing,
+and extracting Programs, Presets, and Sequences in SysEx format.
+
+SD-1 disks hold up to 156 files across 4 sub-directories. Each 512-byte block
+stores raw synthesizer data. SysEx files use nybblized encoding for MIDI transfer.
+
+Run `sd1cli <SUBCOMMAND> --help` for details on each command.",
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -17,40 +30,101 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List all files on a disk image
+    #[command(long_about = "\
+List all files stored on a disk image.
+
+Prints a table with each file's name, type, size in blocks and bytes, and
+directory slot number. Shows total file count and free block count at the end.
+
+Supported file types: OneProgram, OnePreset, OneSequence, ThirtySequences,
+SixtySequences, OperatingSystem.")]
     List {
+        /// Path to the SD-1 disk image file
         image: PathBuf,
     },
     /// Show disk metadata: free blocks, FAT health
+    #[command(long_about = "\
+Inspect a disk image without modifying it.
+
+Displays the disk path, OS-block free count, total block layout, and a
+File Allocation Table (FAT) summary: free, used, and bad block counts.
+
+Note: the OS-block free count may read 0 on hardware-written images; the FAT
+count is always accurate.")]
     Inspect {
+        /// Path to the SD-1 disk image file
         image: PathBuf,
     },
     /// Write a SysEx file to a disk image
+    #[command(long_about = "\
+Write a SysEx (.syx) file into a disk image.
+
+The SysEx file must contain a OneProgram, OnePreset, SingleSequence, or
+AllSequences message. The file is de-nybblized, stored in the disk image, and
+the FAT is updated.
+
+By default the file name is taken from the SysEx filename (stem only, up to 11
+characters). Use --name to override. Use --dir to target a specific sub-directory
+(1–4); otherwise the first directory with free slots is used.
+
+Use --overwrite to replace an existing file with the same name.")]
     Write {
+        /// Path to the SD-1 disk image file
         image: PathBuf,
+        /// Path to the SysEx (.syx) file to write
         sysex: PathBuf,
-        #[arg(long)]
+        /// Override the file name stored on disk (max 11 characters, A–Z 0–9 space)
+        #[arg(long, help = "Override stored file name (max 11 chars)")]
         name: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+        /// Target sub-directory 1–4 (default: first directory with free space)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4), help = "Target sub-directory 1–4")]
         dir: Option<u8>,
-        #[arg(long)]
+        /// Replace an existing file with the same name
+        #[arg(long, help = "Overwrite if a file with this name already exists")]
         overwrite: bool,
     },
     /// Extract a file from a disk image as SysEx
+    #[command(long_about = "\
+Extract a named file from a disk image and save it as a SysEx (.syx) file.
+
+The file is read from the disk image, nybblized, and wrapped in a SysEx
+message. Output defaults to `<NAME>.syx` in the current directory.
+
+Use --out to specify an alternate output path. Use --channel to set the MIDI
+channel embedded in the SysEx header (default 0, i.e. channel 1).")]
     Extract {
+        /// Path to the SD-1 disk image file
         image: PathBuf,
+        /// Name of the file to extract (case-insensitive, max 11 characters)
         name: String,
-        #[arg(long)]
+        /// Output path for the extracted SysEx file (default: <NAME>.syx)
+        #[arg(long, help = "Output file path (default: <NAME>.syx)")]
         out: Option<PathBuf>,
-        #[arg(long, default_value = "0")]
+        /// MIDI channel to embed in the SysEx header (0 = channel 1)
+        #[arg(long, default_value = "0", help = "MIDI channel (0–15, default 0)")]
         channel: u8,
     },
     /// Delete a file from a disk image
+    #[command(long_about = "\
+Delete a named file from a disk image.
+
+Frees the file's FAT chain and removes its directory entry. The disk image is
+saved after deletion. This operation cannot be undone.")]
     Delete {
+        /// Path to the SD-1 disk image file
         image: PathBuf,
+        /// Name of the file to delete (case-insensitive, max 11 characters)
         name: String,
     },
     /// Create a new blank disk image
+    #[command(long_about = "\
+Create a new blank SD-1 disk image.
+
+Writes a 819,200-byte image (1600 × 512-byte blocks) pre-formatted with the
+SD-1 OS structures intact. Blocks 0–22 are reserved; blocks 23–1599 are free.
+The image can be written to a floppy disk with a tool such as `dd`.")]
     Create {
+        /// Path where the new disk image will be written
         image: PathBuf,
     },
 }
@@ -138,9 +212,15 @@ fn cmd_write(
             let prog = Program::from_sysex(&packet)?;
             (prog.to_bytes().to_vec(), FileType::OneProgram)
         }
+        sd1disk::MessageType::AllPrograms => {
+            (packet.payload.clone(), FileType::SixtyPrograms)
+        }
         sd1disk::MessageType::OnePreset => {
             let preset = Preset::from_sysex(&packet)?;
             (preset.to_bytes().to_vec(), FileType::OnePreset)
+        }
+        sd1disk::MessageType::AllPresets => {
+            (packet.payload.clone(), FileType::TwentyPresets)
         }
         sd1disk::MessageType::SingleSequence |
         sd1disk::MessageType::AllSequences => {
@@ -178,11 +258,8 @@ fn cmd_write(
         if !overwrite {
             return Err(sd1disk::Error::FileExists(resolved_name));
         }
-        let old_chain = FileAllocationTable::chain(&img, existing.first_block as u16)?;
-        let freed = old_chain.len() as u32;
         FileAllocationTable::free_chain(&mut img, existing.first_block as u16);
         target_dir.remove(&mut img, &resolved_name)?;
-        img.set_free_blocks(img.free_blocks() + freed);
     }
 
     let n_blocks = data.len().div_ceil(512) as u16;
@@ -200,7 +277,7 @@ fn cmd_write(
     FileAllocationTable::set_chain(&mut img, &blocks);
 
     let entry = DirectoryEntry {
-        type_info: 0,
+        type_info: 0x0F,
         file_type,
         name: name_arr,
         _reserved: 0,
@@ -211,7 +288,6 @@ fn cmd_write(
         size_bytes: data.len() as u32,
     };
     target_dir.add(&mut img, entry)?;
-    img.set_free_blocks(img.free_blocks() - n_blocks as u32);
     img.save(image_path)?;
 
     println!("Written: {} ({} bytes, {} block(s))", resolved_name, data.len(), n_blocks);
@@ -268,7 +344,6 @@ fn cmd_delete(image_path: &Path, name: &str) -> sd1disk::Result<()> {
     let freed = chain.len() as u32;
     FileAllocationTable::free_chain(&mut img, entry.first_block as u16);
     SubDirectory::new(dir_idx).remove(&mut img, name)?;
-    img.set_free_blocks(img.free_blocks() + freed);
     img.save(image_path)?;
 
     println!("Deleted: {} ({} block(s) freed)", name, freed);
