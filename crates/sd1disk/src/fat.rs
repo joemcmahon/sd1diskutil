@@ -2,7 +2,7 @@
 use crate::{DiskImage, Error, Result};
 use std::collections::HashSet;
 
-const FAT_START_BLOCK: usize = 5;
+const FAT_START_BLOCK: usize = 4;
 const ENTRIES_PER_FAT_BLOCK: usize = 170;
 const ENTRY_SIZE: usize = 3;
 const BLOCK_SIZE: usize = 512;
@@ -141,6 +141,27 @@ mod tests {
     use crate::DiskImage;
 
     fn blank() -> DiskImage { DiskImage::create() }
+
+    // Regression: FAT must start at block 4 (hardware format). An earlier version
+    // used block 5, causing the SD-1 to see all files as missing (BAD DEVICE ID).
+    #[test]
+    fn fat_starts_at_block_4_hardware_compatible() {
+        let mut img = blank();
+        // Write a chain at block 23 and verify the bytes land in block 4
+        FileAllocationTable::set_chain(&mut img, &[23u16, 24]);
+        // Block 4 offset 69 = entry 23, byte 0 (should be 0x00 then 0x00 then 0x18=24)
+        let off = 4 * 512 + 23 * 3;
+        assert_eq!(
+            &img.data[off..off + 3], &[0x00, 0x00, 24],
+            "FAT chain for block 23 must be stored in disk block 4 (hardware format)"
+        );
+        // Block 5 at the same relative offset must be untouched (all zero)
+        let off5 = 5 * 512 + 23 * 3;
+        assert_eq!(
+            &img.data[off5..off5 + 3], &[0x00, 0x00, 0x00],
+            "block 5 must NOT contain FAT data (only block 4 does on real hardware)"
+        );
+    }
 
     #[test]
     fn reserved_blocks_are_end_of_file() {
