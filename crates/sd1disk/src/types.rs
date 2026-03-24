@@ -167,6 +167,95 @@ pub fn interleave_sixty_programs(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// Convert an AllSequences SysEx payload to the SD-1 on-disk SixtySequences (No Programs) format.
+///
+/// SysEx AllSequences payload layout:
+///   [0..240]            – 60 × 4-byte internal memory pointer table (SD-1 private; not written to disk)
+///   [240..-(21+11280)]  – sequence event data (track offset tables + track data for all defined seqs)
+///                          The first 12 bytes are an SD-1-internal header; actual data starts at +12.
+///   [-(21+11280)..-21]  – 60 × 188-byte sequence headers
+///   [-21..]             – 21-byte global section
+///                          [0..2]  current selected sequence number (BE u16)
+///                          [2..6]  sum of all sequence data sizes + 0xFC (BE u32)
+///                          [6..21] global sequencer information (15 bytes)
+///
+/// On-disk SixtySequences (No Programs) layout:
+///   [0..11280]          – 60 × 188-byte sequence headers
+///   [11280..11282]      – current selected sequence number
+///   [11282..11286]      – sum of all sequence data sizes + 0xFC
+///   [11286..11301]      – global sequencer information
+///   [11301..11776]      – zeros (475 bytes)
+///   [11776..]           – sequence event data (seq_data_len bytes)
+pub fn allsequences_to_disk(payload: &[u8]) -> Result<Vec<u8>> {
+    const PTR_TABLE_SIZE: usize = 240;
+    const HEADER_SIZE: usize = 188;
+    const HEADER_COUNT: usize = 60;
+    const GLOBAL_SIZE: usize = 21;
+    const HEADERS_TOTAL: usize = HEADER_SIZE * HEADER_COUNT; // 11280
+    const MIN_PAYLOAD: usize = PTR_TABLE_SIZE + HEADERS_TOTAL + GLOBAL_SIZE;
+    const SEQ_DATA_DISK_OFFSET: usize = 11776;
+    const GLOBAL_DISK_START: usize = HEADERS_TOTAL; // 11280
+    const GLOBAL_DISK_END: usize = GLOBAL_DISK_START + GLOBAL_SIZE; // 11301
+    const EVENT_LEAD_ZEROS: usize = 12;
+
+    if payload.len() < MIN_PAYLOAD {
+        return Err(Error::InvalidSysEx("AllSequences payload too short"));
+    }
+
+    let global_sec = &payload[payload.len() - GLOBAL_SIZE..];
+    let headers_start = payload.len() - GLOBAL_SIZE - HEADERS_TOTAL;
+    let headers_sec = &payload[headers_start..payload.len() - GLOBAL_SIZE];
+    let event_data = &payload[PTR_TABLE_SIZE..headers_start];
+
+    if event_data.len() < EVENT_LEAD_ZEROS {
+        return Err(Error::InvalidSysEx("AllSequences payload: event data section too short"));
+    }
+
+    // Global section bytes 2–5 (BE u32) = sum of all seq data sizes + 0xFC.
+    // seq_data_len is the UNPADDED sum; on disk each sequence is padded to a 512-byte block.
+    let size_sum = u32::from_be_bytes([global_sec[2], global_sec[3], global_sec[4], global_sec[5]]);
+    let seq_data_len = (size_sum as usize).saturating_sub(0xFC);
+
+    let event_start = EVENT_LEAD_ZEROS;
+    if event_data.len() < event_start + seq_data_len {
+        return Err(Error::InvalidSysEx("AllSequences payload: event data too short for declared seq_data_len"));
+    }
+    let actual_event_data = &event_data[event_start..event_start + seq_data_len];
+
+    // Compute on-disk padded size: each defined sequence rounded up to 512-byte block.
+    const BLOCK_SIZE: usize = 512;
+    let padded_total: usize = (0..HEADER_COUNT)
+        .filter_map(|slot| {
+            let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+            if hdr[0] == 0xFF { return None; }  // undefined slot
+            let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+            Some((ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE)
+        })
+        .sum();
+
+    let file_size = SEQ_DATA_DISK_OFFSET + padded_total;
+    let mut out = vec![0u8; file_size];
+
+    out[..HEADERS_TOTAL].copy_from_slice(headers_sec);
+    out[GLOBAL_DISK_START..GLOBAL_DISK_END].copy_from_slice(global_sec);
+    // Bytes [11301..11776] remain zero (already zeroed).
+
+    // Write each defined sequence's data at its block-padded position.
+    // SysEx event data is packed (no padding); disk format pads each to 512 bytes.
+    let mut in_pos = 0usize;
+    let mut out_pos = SEQ_DATA_DISK_OFFSET;
+    for slot in 0..HEADER_COUNT {
+        let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        out[out_pos..out_pos + ds].copy_from_slice(&actual_event_data[in_pos..in_pos + ds]);
+        in_pos += ds;
+        out_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+    }
+
+    Ok(out)
+}
+
 /// Reverse of `interleave_sixty_programs`: convert on-disk SixtyPrograms data back
 /// to the AllPrograms SysEx payload order (programs 0,1,2,...,59 in sequence).
 pub fn deinterleave_sixty_programs(data: &[u8]) -> Result<Vec<u8>> {
@@ -268,6 +357,61 @@ mod tests {
         let pkt = make_preset_sysex();
         let preset = Preset::from_sysex(&pkt).unwrap();
         assert_eq!(preset.file_type(), crate::FileType::OnePreset);
+    }
+
+    #[test]
+    fn allsequences_to_disk_layout() {
+        // Build a minimal AllSequences payload with one defined sequence (orig_loc=0, ds=170).
+        // 170 bytes < 512, so on disk it occupies one full 512-byte block.
+        const HEADER_COUNT: usize = 60;
+        const HEADER_SIZE: usize = 188;
+        const HEADERS_TOTAL: usize = HEADER_COUNT * HEADER_SIZE;
+        const SEQ_DATA_LEN: usize = 170;  // one sequence, 170 unpadded bytes
+        const GLOBAL_SIZE: usize = 21;
+        const EVENT_LEAD: usize = 12;
+
+        // size_sum = SEQ_DATA_LEN + 0xFC
+        let size_sum: u32 = SEQ_DATA_LEN as u32 + 0xFC;
+
+        // Build one defined sequence header: orig_loc=0, data_size=170 at bytes 183-185
+        let mut headers = vec![0u8; HEADERS_TOTAL];
+        headers[0] = 0;  // orig_loc = 0 (defined)
+        headers[183] = 0; headers[184] = 0; headers[185] = SEQ_DATA_LEN as u8;
+        // All other slots remain 0xFF-unmarked (byte 0 = 0 = defined), but we only care
+        // about slots where byte 0 != 0xFF. Remaining 59 slots have byte 0 = 0 too, which
+        // makes them "defined" with ds=0. Zero-size sequences contribute nothing to output.
+
+        // Build packed event data: 12 lead zeros + 170 bytes of seq data
+        let seq_bytes: Vec<u8> = (0..SEQ_DATA_LEN as u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 240]);       // ptr table
+        payload.extend_from_slice(&[0u8; EVENT_LEAD]); // 12 lead zeros (skipped)
+        payload.extend_from_slice(&seq_bytes);         // 170 bytes of seq data
+        payload.extend_from_slice(&headers);
+        let mut global = [0u8; GLOBAL_SIZE];
+        global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+        payload.extend_from_slice(&global);
+
+        let disk = allsequences_to_disk(&payload).unwrap();
+
+        // File size = 11776 + 512 (170 bytes padded to one 512-byte block)
+        assert_eq!(disk.len(), 11776 + 512);
+        // Headers at [0..11280]
+        assert_eq!(&disk[..HEADERS_TOTAL], headers.as_slice());
+        // Global at [11280..11301]
+        assert_eq!(&disk[11280..11301], &global[..]);
+        // Padding at [11301..11776] all zeros
+        assert!(disk[11301..11776].iter().all(|&b| b == 0));
+        // Sequence data at [11776..11776+170] — matches seq_bytes
+        assert_eq!(&disk[11776..11776 + SEQ_DATA_LEN], seq_bytes.as_slice());
+        // Padding bytes [11776+170..11776+512] are zero
+        assert!(disk[11776 + SEQ_DATA_LEN..11776 + 512].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn allsequences_to_disk_rejects_short_payload() {
+        let result = allsequences_to_disk(&[0u8; 100]);
+        assert!(result.is_err());
     }
 
     #[test]

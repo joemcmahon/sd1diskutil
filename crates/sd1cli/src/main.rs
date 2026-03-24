@@ -262,10 +262,8 @@ fn cmd_write(
                 (seq.to_bytes().to_vec(), FileType::OneSequence)
             }
             sd1disk::MessageType::AllSequences => {
-                // The on-disk sequence format differs from the SysEx payload format —
-                // the transformation is not yet implemented.
-                eprintln!("Warning: AllSequences on-disk format not yet implemented; skipping sequence packet");
-                continue;
+                let disk_data = sd1disk::allsequences_to_disk(&packet.payload)?;
+                (disk_data, FileType::SixtySequences)
             }
             _other => {
                 return Err(sd1disk::Error::InvalidSysEx("unsupported SysEx message type for write"));
