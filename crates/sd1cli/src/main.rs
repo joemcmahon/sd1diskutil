@@ -347,8 +347,16 @@ fn cmd_write(
         }
         FileAllocationTable::set_chain(&mut img, &blocks);
 
+        // type_info bit 5 (0x20) signals programs are embedded in a SixtySequences file.
+        // The SD-1 uses this bit to decide whether seq data is at 11776 (no programs)
+        // or at 44032 (60-programs variant). Bit 0x0F identifies the SixtySequences type.
+        let type_info = if matches!(file_type, FileType::SixtySequences) && embed_programs {
+            0x2F  // 0x20 (programs embedded) | 0x0F (SixtySequences bits)
+        } else {
+            0x0F
+        };
         let entry = DirectoryEntry {
-            type_info: 0x0F,
+            type_info,
             file_type,
             name: name_arr,
             _reserved: 0,
