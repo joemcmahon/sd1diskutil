@@ -218,34 +218,9 @@ fn cmd_write(
     overwrite: bool,
 ) -> sd1disk::Result<()> {
     let sysex_bytes = std::fs::read(sysex_path)?;
-    let packet = SysExPacket::parse(&sysex_bytes)?;
+    let packets = SysExPacket::parse_all(&sysex_bytes)?;
 
-    let (data, file_type) = match &packet.message_type {
-        sd1disk::MessageType::OneProgram => {
-            let prog = Program::from_sysex(&packet)?;
-            (prog.to_bytes().to_vec(), FileType::OneProgram)
-        }
-        sd1disk::MessageType::AllPrograms => {
-            (sd1disk::interleave_sixty_programs(&packet.payload)?, FileType::SixtyPrograms)
-        }
-        sd1disk::MessageType::OnePreset => {
-            let preset = Preset::from_sysex(&packet)?;
-            (preset.to_bytes().to_vec(), FileType::OnePreset)
-        }
-        sd1disk::MessageType::AllPresets => {
-            (packet.payload.clone(), FileType::TwentyPresets)
-        }
-        sd1disk::MessageType::SingleSequence |
-        sd1disk::MessageType::AllSequences => {
-            let seq = Sequence::from_sysex(&packet)?;
-            (seq.to_bytes().to_vec(), seq.file_type())
-        }
-        _other => {
-            return Err(sd1disk::Error::InvalidSysEx("unsupported SysEx message type for write"));
-        }
-    };
-
-    let resolved_name = if let Some(n) = name_override {
+    let base_name = if let Some(n) = name_override {
         n.to_uppercase()
     } else {
         sysex_path.file_stem()
@@ -254,56 +229,115 @@ fn cmd_write(
             .to_uppercase()
     };
 
-    let name_arr = validate_name(&resolved_name)?;
+    // Collect writable packets; skip Command and Error (housekeeping packets)
+    let writable: Vec<&SysExPacket> = packets.iter().filter(|p| {
+        !matches!(p.message_type, sd1disk::MessageType::Command | sd1disk::MessageType::Error)
+    }).collect();
 
+    if writable.is_empty() {
+        return Err(sd1disk::Error::InvalidSysEx("no writable packets in SysEx file"));
+    }
+
+    let multi = writable.len() > 1;
     let mut img = DiskImage::open(image_path)?;
 
-    let target_dir_idx: u8 = if let Some(d) = dir_override {
-        d - 1
-    } else {
-        (0..4u8)
-            .find(|&i| SubDirectory::new(i).free_slots(&img) > 0)
-            .ok_or(sd1disk::Error::DirectoryFull)?
-    };
-    let target_dir = SubDirectory::new(target_dir_idx);
+    for packet in &writable {
+        let (data, file_type) = match &packet.message_type {
+            sd1disk::MessageType::OneProgram => {
+                let prog = Program::from_sysex(packet)?;
+                (prog.to_bytes().to_vec(), FileType::OneProgram)
+            }
+            sd1disk::MessageType::AllPrograms => {
+                (sd1disk::interleave_sixty_programs(&packet.payload)?, FileType::SixtyPrograms)
+            }
+            sd1disk::MessageType::OnePreset => {
+                let preset = Preset::from_sysex(packet)?;
+                (preset.to_bytes().to_vec(), FileType::OnePreset)
+            }
+            sd1disk::MessageType::AllPresets => {
+                (packet.payload.clone(), FileType::TwentyPresets)
+            }
+            sd1disk::MessageType::SingleSequence => {
+                let seq = Sequence::from_sysex(packet)?;
+                (seq.to_bytes().to_vec(), FileType::OneSequence)
+            }
+            sd1disk::MessageType::AllSequences => {
+                // The on-disk sequence format differs from the SysEx payload format —
+                // the transformation is not yet implemented.
+                eprintln!("Warning: AllSequences on-disk format not yet implemented; skipping sequence packet");
+                continue;
+            }
+            _other => {
+                return Err(sd1disk::Error::InvalidSysEx("unsupported SysEx message type for write"));
+            }
+        };
 
-    if let Some(existing) = target_dir.find(&img, &resolved_name) {
-        if !overwrite {
-            return Err(sd1disk::Error::FileExists(resolved_name));
+        // For multi-packet files, append a type suffix so each file has a unique name.
+        // Limit prefix to 8 chars so suffixes fit within the 11-char name limit.
+        let file_name = if multi {
+            let prefix = &base_name[..base_name.len().min(8)];
+            match &packet.message_type {
+                sd1disk::MessageType::AllPresets | sd1disk::MessageType::OnePreset => {
+                    format!("{}PST", prefix)
+                }
+                sd1disk::MessageType::AllSequences | sd1disk::MessageType::SingleSequence => {
+                    format!("{}SEQ", prefix)
+                }
+                _ => base_name[..base_name.len().min(11)].to_string(),
+            }
+        } else {
+            base_name[..base_name.len().min(11)].to_string()
+        };
+
+        let name_arr = validate_name(&file_name)?;
+
+        let target_dir_idx: u8 = if let Some(d) = dir_override {
+            d - 1
+        } else {
+            (0..4u8)
+                .find(|&i| SubDirectory::new(i).free_slots(&img) > 0)
+                .ok_or(sd1disk::Error::DirectoryFull)?
+        };
+        let target_dir = SubDirectory::new(target_dir_idx);
+
+        if let Some(existing) = target_dir.find(&img, &file_name) {
+            if !overwrite {
+                return Err(sd1disk::Error::FileExists(file_name));
+            }
+            FileAllocationTable::free_chain(&mut img, existing.first_block as u16);
+            target_dir.remove(&mut img, &file_name)?;
         }
-        FileAllocationTable::free_chain(&mut img, existing.first_block as u16);
-        target_dir.remove(&mut img, &resolved_name)?;
+
+        let n_blocks = data.len().div_ceil(512) as u16;
+        let blocks = FileAllocationTable::allocate(&mut img, n_blocks)?;
+
+        for (i, &block_num) in blocks.iter().enumerate() {
+            let start = i * 512;
+            let end = (start + 512).min(data.len());
+            let block = img.block_mut(block_num)?;
+            block.fill(0);
+            if end > start {
+                block[..end - start].copy_from_slice(&data[start..end]);
+            }
+        }
+        FileAllocationTable::set_chain(&mut img, &blocks);
+
+        let entry = DirectoryEntry {
+            type_info: 0x0F,
+            file_type,
+            name: name_arr,
+            _reserved: 0,
+            size_blocks: n_blocks,
+            contiguous_blocks: n_blocks,
+            first_block: blocks[0] as u32,
+            file_number: 0,
+            size_bytes: data.len() as u32,
+        };
+        target_dir.add(&mut img, entry)?;
+        println!("Written: {} ({} bytes, {} block(s))", file_name, data.len(), n_blocks);
     }
 
-    let n_blocks = data.len().div_ceil(512) as u16;
-    let blocks = FileAllocationTable::allocate(&mut img, n_blocks)?;
-
-    for (i, &block_num) in blocks.iter().enumerate() {
-        let start = i * 512;
-        let end = (start + 512).min(data.len());
-        let block = img.block_mut(block_num)?;
-        block.fill(0);
-        if end > start {
-            block[..end - start].copy_from_slice(&data[start..end]);
-        }
-    }
-    FileAllocationTable::set_chain(&mut img, &blocks);
-
-    let entry = DirectoryEntry {
-        type_info: 0x0F,
-        file_type,
-        name: name_arr,
-        _reserved: 0,
-        size_blocks: n_blocks,
-        contiguous_blocks: n_blocks,
-        first_block: blocks[0] as u32,
-        file_number: 0,
-        size_bytes: data.len() as u32,
-    };
-    target_dir.add(&mut img, entry)?;
     img.save(image_path)?;
-
-    println!("Written: {} ({} bytes, {} block(s))", resolved_name, data.len(), n_blocks);
     Ok(())
 }
 
