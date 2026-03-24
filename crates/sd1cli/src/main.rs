@@ -238,10 +238,34 @@ fn cmd_write(
         return Err(sd1disk::Error::InvalidSysEx("no writable packets in SysEx file"));
     }
 
-    let multi = writable.len() > 1;
+    // When both AllPrograms and AllSequences are present in the same dump, the SD-1 disk
+    // format requires the programs to be embedded inside the SixtySequences file (60-programs
+    // layout). Pre-interleave the programs now so the AllPrograms packet can be skipped during
+    // the write loop; the AllSequences arm will embed them.
+    let has_all_programs = writable.iter().any(|p| matches!(p.message_type, sd1disk::MessageType::AllPrograms));
+    let has_all_sequences = writable.iter().any(|p| matches!(p.message_type, sd1disk::MessageType::AllSequences));
+    let embed_programs = has_all_programs && has_all_sequences;
+
+    let interleaved_for_seq: Option<Vec<u8>> = if embed_programs {
+        let prog_pkt = writable.iter()
+            .find(|p| matches!(p.message_type, sd1disk::MessageType::AllPrograms))
+            .unwrap();
+        Some(sd1disk::interleave_sixty_programs(&prog_pkt.payload)?)
+    } else {
+        None
+    };
+
+    // Effective file count: AllPrograms is absorbed when embed_programs is true.
+    let effective_count = if embed_programs { writable.len() - 1 } else { writable.len() };
+    let multi = effective_count > 1;
     let mut img = DiskImage::open(image_path)?;
 
     for packet in &writable {
+        // AllPrograms is embedded in the AllSequences file when both are present.
+        if embed_programs && matches!(packet.message_type, sd1disk::MessageType::AllPrograms) {
+            continue;
+        }
+
         let (data, file_type) = match &packet.message_type {
             sd1disk::MessageType::OneProgram => {
                 let prog = Program::from_sysex(packet)?;
@@ -262,7 +286,10 @@ fn cmd_write(
                 (seq.to_bytes().to_vec(), FileType::OneSequence)
             }
             sd1disk::MessageType::AllSequences => {
-                let disk_data = sd1disk::allsequences_to_disk(&packet.payload)?;
+                let disk_data = sd1disk::allsequences_to_disk(
+                    &packet.payload,
+                    interleaved_for_seq.as_deref(),
+                )?;
                 (disk_data, FileType::SixtySequences)
             }
             _other => {

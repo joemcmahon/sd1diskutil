@@ -186,17 +186,46 @@ pub fn interleave_sixty_programs(payload: &[u8]) -> Result<Vec<u8>> {
 ///   [11286..11301]      – global sequencer information
 ///   [11301..11776]      – zeros (475 bytes)
 ///   [11776..]           – sequence event data (seq_data_len bytes)
-pub fn allsequences_to_disk(payload: &[u8]) -> Result<Vec<u8>> {
+/// Convert an AllSequences SysEx payload to the on-disk SixtySequences format.
+///
+/// If `interleaved_programs` is `Some`, it must be exactly 60 × 530 = 31800 bytes of
+/// already-interleaved program data (output of `interleave_sixty_programs`). The programs
+/// are embedded between the global section and the sequence data, producing the
+/// "SixtySequences + 60 Programs" on-disk layout:
+///
+/// ```text
+/// 00000–11279  Sequence headers (60 × 188)
+/// 11280–11300  Global section (21 bytes)
+/// 11301–11775  Zeros (475 bytes)
+/// 11776–43575  60 Programs interleaved (31800 bytes)   ← only when programs provided
+/// 43576–44031  Zeros (456 bytes)                       ← only when programs provided
+/// 44032–…      Sequence data (block-padded)             ← offset shifts with programs
+/// ```
+///
+/// Without programs the sequence data starts at 11776 (no-programs layout).
+pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>) -> Result<Vec<u8>> {
     const PTR_TABLE_SIZE: usize = 240;
     const HEADER_SIZE: usize = 188;
     const HEADER_COUNT: usize = 60;
     const GLOBAL_SIZE: usize = 21;
     const HEADERS_TOTAL: usize = HEADER_SIZE * HEADER_COUNT; // 11280
     const MIN_PAYLOAD: usize = PTR_TABLE_SIZE + HEADERS_TOTAL + GLOBAL_SIZE;
-    const SEQ_DATA_DISK_OFFSET: usize = 11776;
     const GLOBAL_DISK_START: usize = HEADERS_TOTAL; // 11280
     const GLOBAL_DISK_END: usize = GLOBAL_DISK_START + GLOBAL_SIZE; // 11301
     const EVENT_LEAD_ZEROS: usize = 12;
+    // Layout constants for the 60-programs variant
+    const PROGRAMS_DISK_OFFSET: usize = 11776;
+    const PROGRAMS_SIZE: usize = 60 * 530; // 31800
+    const SEQ_DATA_WITH_PROGRAMS: usize = 44032;
+    const SEQ_DATA_NO_PROGRAMS: usize = 11776;
+
+    if let Some(progs) = interleaved_programs {
+        if progs.len() != PROGRAMS_SIZE {
+            return Err(Error::InvalidSysEx(
+                "interleaved programs must be exactly 60 × 530 bytes",
+            ));
+        }
+    }
 
     if payload.len() < MIN_PAYLOAD {
         return Err(Error::InvalidSysEx("AllSequences payload too short"));
@@ -233,17 +262,27 @@ pub fn allsequences_to_disk(payload: &[u8]) -> Result<Vec<u8>> {
         })
         .sum();
 
-    let file_size = SEQ_DATA_DISK_OFFSET + padded_total;
+    let seq_data_offset = if interleaved_programs.is_some() {
+        SEQ_DATA_WITH_PROGRAMS
+    } else {
+        SEQ_DATA_NO_PROGRAMS
+    };
+
+    let file_size = seq_data_offset + padded_total;
     let mut out = vec![0u8; file_size];
 
     out[..HEADERS_TOTAL].copy_from_slice(headers_sec);
     out[GLOBAL_DISK_START..GLOBAL_DISK_END].copy_from_slice(global_sec);
-    // Bytes [11301..11776] remain zero (already zeroed).
+
+    if let Some(progs) = interleaved_programs {
+        // Embed programs at 11776; zeros at 43576..44032 are already zeroed.
+        out[PROGRAMS_DISK_OFFSET..PROGRAMS_DISK_OFFSET + PROGRAMS_SIZE].copy_from_slice(progs);
+    }
 
     // Write each defined sequence's data at its block-padded position.
     // SysEx event data is packed (no padding); disk format pads each to 512 bytes.
     let mut in_pos = 0usize;
-    let mut out_pos = SEQ_DATA_DISK_OFFSET;
+    let mut out_pos = seq_data_offset;
     for slot in 0..HEADER_COUNT {
         let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
         if hdr[0] == 0xFF { continue; }
@@ -392,7 +431,7 @@ mod tests {
         global[2..6].copy_from_slice(&size_sum.to_be_bytes());
         payload.extend_from_slice(&global);
 
-        let disk = allsequences_to_disk(&payload).unwrap();
+        let disk = allsequences_to_disk(&payload, None).unwrap();
 
         // File size = 11776 + 512 (170 bytes padded to one 512-byte block)
         assert_eq!(disk.len(), 11776 + 512);
@@ -410,7 +449,7 @@ mod tests {
 
     #[test]
     fn allsequences_to_disk_rejects_short_payload() {
-        let result = allsequences_to_disk(&[0u8; 100]);
+        let result = allsequences_to_disk(&[0u8; 100], None);
         assert!(result.is_err());
     }
 

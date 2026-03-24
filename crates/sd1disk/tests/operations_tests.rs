@@ -289,7 +289,7 @@ fn allsequences_write_then_list_finds_file_with_correct_size() {
         payload,
     };
 
-    let disk_data = sd1disk::allsequences_to_disk(&pkt.payload).unwrap();
+    let disk_data = sd1disk::allsequences_to_disk(&pkt.payload, None).unwrap();
     assert_eq!(disk_data.len(), EXPECTED_BYTES as usize);
 
     let mut img = DiskImage::create();
@@ -332,7 +332,7 @@ fn allsequences_write_then_list_finds_file_with_correct_size() {
 fn allsequences_write_verify_seq_data_on_disk() {
     // Verify the actual sequence bytes land at offset 11776 in the FAT chain.
     let payload = make_allsequences_payload();
-    let disk_data = sd1disk::allsequences_to_disk(&payload).unwrap();
+    let disk_data = sd1disk::allsequences_to_disk(&payload, None).unwrap();
 
     // seq_bytes from the fixture is 0..170
     let expected_seq: Vec<u8> = (0u8..170).collect();
