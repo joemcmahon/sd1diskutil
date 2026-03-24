@@ -1,4 +1,4 @@
-use sd1disk::{DiskImage, SubDirectory, FileAllocationTable, Program, DirectoryEntry};
+use sd1disk::{DiskImage, SubDirectory, FileAllocationTable, Program, DirectoryEntry, FileType};
 use sd1disk::sysex::{MessageType, SysExPacket};
 use std::path::Path;
 
@@ -236,6 +236,109 @@ fn delete_file_not_found_returns_error() {
     let dir = SubDirectory::new(0);
     let result = dir.remove(&mut img, "NONEXISTENT");
     assert!(matches!(result, Err(sd1disk::Error::FileNotFound(_))));
+}
+
+// ===== AllSequences write pipeline =====
+
+/// Build a minimal AllSequences SysEx payload with one defined sequence (data_size=170).
+/// All other 59 sequence header slots have byte 0 == 0 (which the code treats as "defined"
+/// but with ds=0, so they contribute nothing to output).
+fn make_allsequences_payload() -> Vec<u8> {
+    const HEADER_COUNT: usize = 60;
+    const HEADER_SIZE: usize = 188;
+    const HEADERS_TOTAL: usize = HEADER_COUNT * HEADER_SIZE;
+    const SEQ_DATA_LEN: usize = 170;
+    const GLOBAL_SIZE: usize = 21;
+    const EVENT_LEAD: usize = 12;
+
+    let size_sum: u32 = SEQ_DATA_LEN as u32 + 0xFC;
+
+    let mut headers = vec![0u8; HEADERS_TOTAL];
+    // Slot 0: defined (orig_loc=0), data_size=170 at bytes 183-185
+    headers[183] = 0;
+    headers[184] = 0;
+    headers[185] = SEQ_DATA_LEN as u8;
+    // Slots 1-59: mark as undefined (byte 0 = 0xFF) so they're skipped
+    for slot in 1..HEADER_COUNT {
+        headers[slot * HEADER_SIZE] = 0xFF;
+    }
+
+    let seq_bytes: Vec<u8> = (0..SEQ_DATA_LEN as u8).collect();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; 240]);        // ptr table
+    payload.extend_from_slice(&[0u8; EVENT_LEAD]); // 12 lead zeros (skipped)
+    payload.extend_from_slice(&seq_bytes);          // packed seq data
+    payload.extend_from_slice(&headers);
+    let mut global = [0u8; GLOBAL_SIZE];
+    global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+    payload.extend_from_slice(&global);
+    payload
+}
+
+#[test]
+fn allsequences_write_then_list_finds_file_with_correct_size() {
+    // 170 bytes padded to 512 → file = 11776 + 512 = 12288 bytes = 24 blocks
+    const EXPECTED_BYTES: u32 = 11776 + 512;
+    const EXPECTED_BLOCKS: u16 = (EXPECTED_BYTES / 512) as u16;
+
+    let payload = make_allsequences_payload();
+    let pkt = SysExPacket {
+        message_type: MessageType::AllSequences,
+        midi_channel: 0,
+        model: 0,
+        payload,
+    };
+
+    let disk_data = sd1disk::allsequences_to_disk(&pkt.payload).unwrap();
+    assert_eq!(disk_data.len(), EXPECTED_BYTES as usize);
+
+    let mut img = DiskImage::create();
+    img.set_free_blocks(1577);
+
+    let n_blocks = ((disk_data.len() + 511) / 512) as u16;
+    assert_eq!(n_blocks, EXPECTED_BLOCKS);
+
+    let blocks = FileAllocationTable::allocate(&mut img, n_blocks).unwrap();
+    for (i, &b) in blocks.iter().enumerate() {
+        let start = i * 512;
+        let end = (start + 512).min(disk_data.len());
+        let block = img.block_mut(b).unwrap();
+        if end > start {
+            block[..end - start].copy_from_slice(&disk_data[start..end]);
+        }
+    }
+    FileAllocationTable::set_chain(&mut img, &blocks);
+
+    let entry = DirectoryEntry {
+        type_info: 0,
+        file_type: FileType::SixtySequences,
+        name: name_bytes("SEQ-TEST"),
+        _reserved: 0,
+        size_blocks: n_blocks,
+        contiguous_blocks: n_blocks,
+        first_block: blocks[0] as u32,
+        file_number: 0,
+        size_bytes: disk_data.len() as u32,
+    };
+    SubDirectory::new(0).add(&mut img, entry).unwrap();
+
+    let found = SubDirectory::new(0).find(&img, "SEQ-TEST").unwrap();
+    assert_eq!(found.size_bytes, EXPECTED_BYTES);
+    assert_eq!(found.size_blocks, EXPECTED_BLOCKS);
+    assert_eq!(found.file_type, FileType::SixtySequences);
+}
+
+#[test]
+fn allsequences_write_verify_seq_data_on_disk() {
+    // Verify the actual sequence bytes land at offset 11776 in the FAT chain.
+    let payload = make_allsequences_payload();
+    let disk_data = sd1disk::allsequences_to_disk(&payload).unwrap();
+
+    // seq_bytes from the fixture is 0..170
+    let expected_seq: Vec<u8> = (0u8..170).collect();
+    assert_eq!(&disk_data[11776..11776 + 170], expected_seq.as_slice());
+    // Padding after the sequence data to end of block should be zero
+    assert!(disk_data[11776 + 170..11776 + 512].iter().all(|&b| b == 0));
 }
 
 // ===== Task 11: Save/Reload Round-Trip =====
