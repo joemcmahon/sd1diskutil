@@ -8,7 +8,7 @@ pub mod fat;
 pub use fat::{FatEntry, FileAllocationTable};
 
 pub mod directory;
-pub use directory::{DirectoryEntry, FileType, SubDirectory, validate_name};
+pub use directory::{DirectoryEntry, FileType, SubDirectory, validate_name, block1_entries, block1_find};
 
 pub mod sysex;
 pub use sysex::{MessageType, SysExPacket};

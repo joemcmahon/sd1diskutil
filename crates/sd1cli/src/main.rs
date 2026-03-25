@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
+    block1_entries, block1_find,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -163,25 +164,38 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
     }
 }
 
+fn all_entries(img: &DiskImage) -> Vec<DirectoryEntry> {
+    // Prefer block-15 subdirectories (hardware / our format).
+    // The VST3 plugin zeroes block 15 and writes all entries to block 1 instead.
+    // Detect this by checking whether subdirectory 0 (block 15) contains any valid entries;
+    // if not, fall back to the block-1 flat directory.
+    if SubDirectory::new(0).entries(img).is_empty() {
+        let b1 = block1_entries(img);
+        if !b1.is_empty() {
+            return b1;
+        }
+    }
+    (0..4u8)
+        .flat_map(|i| SubDirectory::new(i).entries(img))
+        .collect()
+}
+
 fn cmd_list(image_path: &Path) -> sd1disk::Result<()> {
     let img = DiskImage::open(image_path)?;
     println!("{:<12} {:<22} {:>6} {:>6} {:>4}",
         "NAME", "TYPE", "BLOCKS", "BYTES", "SLOT");
     println!("{}", "-".repeat(56));
     let mut total = 0usize;
-    for dir_idx in 0..4u8 {
-        let dir = SubDirectory::new(dir_idx);
-        for entry in dir.entries(&img) {
-            let type_str = format!("{:?}", entry.file_type);
-            println!("{:<12} {:<22} {:>6} {:>6} {:>4}",
-                entry.name_str(),
-                type_str,
-                entry.size_blocks,
-                entry.size_bytes,
-                entry.file_number,
-            );
-            total += 1;
-        }
+    for entry in all_entries(&img) {
+        let type_str = format!("{:?}", entry.file_type);
+        println!("{:<12} {:<22} {:>6} {:>6} {:>4}",
+            entry.name_str(),
+            type_str,
+            entry.size_blocks,
+            entry.size_bytes,
+            entry.file_number,
+        );
+        total += 1;
     }
     let free_count = (23u16..1600)
         .filter(|&b| sd1disk::FileAllocationTable::entry(&img, b) == sd1disk::FatEntry::Free)
@@ -384,6 +398,7 @@ fn cmd_extract(
 
     let entry = (0..4u8)
         .find_map(|i| SubDirectory::new(i).find(&img, name))
+        .or_else(|| block1_find(&img, name))
         .ok_or_else(|| sd1disk::Error::FileNotFound(name.to_string()))?;
 
     let chain = FileAllocationTable::chain(&img, entry.first_block as u16)?;

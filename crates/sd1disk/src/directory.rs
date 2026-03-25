@@ -7,6 +7,9 @@ const SUBDIR_ENTRY_SIZE: usize = 26;
 const SUBDIR_CAPACITY: usize = 39;
 const SUBDIR_START_BLOCK: u16 = 15;  // SubDir 0 starts at block 15
 
+/// Byte offset within block 1 where the VST3 plugin writes directory entries.
+const BLOCK1_DIR_OFFSET: usize = BLOCK_SIZE + 0x1e;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileType {
     OneProgram,
@@ -92,6 +95,50 @@ impl DirectoryEntry {
     }
 }
 
+/// Parse one 26-byte directory entry from a raw slice. Returns None for empty or invalid slots.
+fn parse_entry(data: &[u8]) -> Option<DirectoryEntry> {
+    if data.len() < SUBDIR_ENTRY_SIZE { return None; }
+    if data[1] == 0 { return None; }
+    let file_type = FileType::from_byte(data[1]).ok()?;
+    let mut name = [0u8; 11];
+    name.copy_from_slice(&data[2..13]);
+    let size_blocks       = u16::from_be_bytes([data[14], data[15]]);
+    let contiguous_blocks = u16::from_be_bytes([data[16], data[17]]);
+    let first_block       = u32::from_be_bytes([data[18], data[19], data[20], data[21]]);
+    let file_number       = data[22];
+    let size_bytes        = u32::from_be_bytes([0, data[23], data[24], data[25]]);
+    Some(DirectoryEntry {
+        type_info: data[0],
+        file_type,
+        name,
+        _reserved: data[13],
+        size_blocks,
+        contiguous_blocks,
+        first_block,
+        file_number,
+        size_bytes,
+    })
+}
+
+/// Read all valid directory entries written by the VST3 plugin at block 1 offset 0x1e.
+/// On normal (hardware-formatted) disks the OS data at block 1 contains no valid file-type
+/// bytes at that offset, so this returns an empty Vec.
+pub fn block1_entries(image: &DiskImage) -> Vec<DirectoryEntry> {
+    let base = BLOCK1_DIR_OFFSET;
+    (0..SUBDIR_CAPACITY)
+        .filter_map(|slot| {
+            let off = base + slot * SUBDIR_ENTRY_SIZE;
+            if off + SUBDIR_ENTRY_SIZE > image.data.len() { return None; }
+            parse_entry(&image.data[off..off + SUBDIR_ENTRY_SIZE])
+        })
+        .collect()
+}
+
+/// Find a named entry in the VST3 block-1 directory. Case-sensitive.
+pub fn block1_find(image: &DiskImage, name: &str) -> Option<DirectoryEntry> {
+    block1_entries(image).into_iter().find(|e| e.name_str() == name)
+}
+
 /// Validate that a name fits in 11 bytes and is non-empty.
 /// Returns the name as a space-padded [u8; 11] array.
 pub fn validate_name(name: &str) -> Result<[u8; 11]> {
@@ -124,30 +171,7 @@ impl SubDirectory {
 
     fn read_entry(&self, image: &DiskImage, slot: usize) -> Option<DirectoryEntry> {
         let off = self.entry_offset(slot);
-        let data = &image.data[off..off + SUBDIR_ENTRY_SIZE];
-        // A zero type byte in slot 1 (byte index 1) means empty slot
-        if data[1] == 0 {
-            return None;
-        }
-        let file_type = FileType::from_byte(data[1]).ok()?;
-        let mut name = [0u8; 11];
-        name.copy_from_slice(&data[2..13]);
-        let size_blocks       = u16::from_be_bytes([data[14], data[15]]);
-        let contiguous_blocks = u16::from_be_bytes([data[16], data[17]]);
-        let first_block       = u32::from_be_bytes([data[18], data[19], data[20], data[21]]);
-        let file_number       = data[22];
-        let size_bytes        = u32::from_be_bytes([0, data[23], data[24], data[25]]);
-        Some(DirectoryEntry {
-            type_info: data[0],
-            file_type,
-            name,
-            _reserved: data[13],
-            size_blocks,
-            contiguous_blocks,
-            first_block,
-            file_number,
-            size_bytes,
-        })
+        parse_entry(&image.data[off..off + SUBDIR_ENTRY_SIZE])
     }
 
     fn write_entry(&self, image: &mut DiskImage, slot: usize, entry: &DirectoryEntry) {
@@ -330,5 +354,69 @@ mod tests {
             FileType::from_byte(0xFF),
             Err(crate::Error::InvalidFileType(0xFF))
         ));
+    }
+
+    // VST3 writes its directory to block 1 at offset 0x1e, zeroing block 15.
+    // block1_entries() must read those entries correctly.
+    #[test]
+    fn block1_entries_reads_vst3_directory() {
+        let mut img = blank();
+        // Manually write two entries at block 1 offset 0x1e (VST3 format)
+        let offset = 1 * BLOCK_SIZE + 0x1e;
+        // Entry 0: TwentyPresets "SEQ-DB FPST"
+        let e0: &[u8] = &[
+            0x0f, 0x10,                                              // type_info, file_type
+            b'S', b'E', b'Q', b'-', b'D', b'B', b' ', b'F', b'P', b'S', b'T', // name (11)
+            0x00,                                                    // _reserved
+            0x00, 0x02,                                              // size_blocks
+            0x00, 0x02,                                              // contiguous_blocks
+            0x00, 0x00, 0x00, 0x17,                                  // first_block = 23
+            0x00,                                                    // file_number
+            0x00, 0x03, 0xc0,                                        // size_bytes = 960
+        ];
+        img.data[offset..offset + SUBDIR_ENTRY_SIZE].copy_from_slice(e0);
+        // Entry 1: SixtySequences "SEQ-DB FSEQ"
+        let e1: &[u8] = &[
+            0x2f, 0x13,
+            b'S', b'E', b'Q', b'-', b'D', b'B', b' ', b'F', b'S', b'E', b'Q',
+            0x00,
+            0x00, 0xb2,
+            0x00, 0xb2,
+            0x00, 0x00, 0x00, 0x19,
+            0x00,
+            0x01, 0x64, 0x00,
+        ];
+        img.data[offset + SUBDIR_ENTRY_SIZE..offset + 2 * SUBDIR_ENTRY_SIZE].copy_from_slice(e1);
+
+        let entries = block1_entries(&img);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name_str(), "SEQ-DB FPST");
+        assert_eq!(entries[0].file_type, FileType::TwentyPresets);
+        assert_eq!(entries[0].size_bytes, 960);
+        assert_eq!(entries[1].name_str(), "SEQ-DB FSEQ");
+        assert_eq!(entries[1].file_type, FileType::SixtySequences);
+        assert_eq!(entries[1].first_block, 25);
+    }
+
+    #[test]
+    fn block1_entries_returns_empty_on_normal_disk() {
+        // A blank disk has the SD-1 OS data at block 1; block1_entries must return nothing.
+        let img = blank();
+        let entries = block1_entries(&img);
+        assert!(entries.is_empty(), "normal disk block 1 should yield no directory entries");
+    }
+
+    #[test]
+    fn block1_find_locates_entry_by_name() {
+        let mut img = blank();
+        let offset = 1 * BLOCK_SIZE + 0x1e;
+        let e0: &[u8] = &[
+            0x0f, 0x13,
+            b'M', b'Y', b'F', b'I', b'L', b'E', b' ', b' ', b' ', b' ', b' ',
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x02, 0x00,
+        ];
+        img.data[offset..offset + SUBDIR_ENTRY_SIZE].copy_from_slice(e0);
+        assert!(block1_find(&img, "MYFILE").is_some());
+        assert!(block1_find(&img, "NOTHERE").is_none());
     }
 }
