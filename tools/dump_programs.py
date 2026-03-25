@@ -278,13 +278,10 @@ def decode_b10(b10: int, disk_programs: list[str] | None = None) -> str:
     if b10 == 0x7F:
         return "(no prog change)"
     if b10 <= 0x3B:  # 0–59: RAM (INT0) user bank, addressed as bank*6+patch
-        # The de-interleave separates banks 0-4 (even slots) from banks 5-9 (odd slots):
-        #   banks 0-4: de-interleaved slot = b10 * 2  (b10 < 30)
-        #   banks 5-9: de-interleaved slot = (b10 - 30) * 2 + 1  (b10 >= 30)
+        # After de-interleaving, disk_programs[b10] is the program at that b10 position directly.
         if disk_programs:
-            deint_slot = b10 * 2 if b10 < 30 else (b10 - 30) * 2 + 1
-            if deint_slot < len(disk_programs):
-                return f"RAM[{b10}]={disk_programs[deint_slot]}"
+            if b10 < len(disk_programs):
+                return f"RAM[{b10}]={disk_programs[b10]}"
         if b10 < len(INT0_PROGRAMS):
             return f"RAM[{b10}]={INT0_PROGRAMS[b10]}"
         return f"RAM[{b10}]=?"
