@@ -161,18 +161,16 @@ def extract_file(img: bytearray, entry: dict) -> bytes:
 # ─── Program helpers ──────────────────────────────────────────────────────────
 
 def deinterleave_sixty_programs(data: bytes) -> bytes:
-    """Mirror of Rust deinterleave_sixty_programs."""
+    """Mirror of Rust deinterleave_sixty_programs.
+
+    Even bytes (positions 0,2,4,...) form programs 0–29 (first 15900 bytes of output).
+    Odd bytes  (positions 1,3,5,...) form programs 30–59 (last  15900 bytes of output).
+    """
     expected = SIXTY_PROGRAMS_COUNT * PROGRAM_SIZE
     assert len(data) == expected, f"expected {expected} bytes, got {len(data)}"
-    even_data = bytes(data[i] for i in range(0, expected, 2))   # bytes at even positions
-    odd_data  = bytes(data[i] for i in range(1, expected, 2))   # bytes at odd positions
-    result = bytearray(expected)
-    for k in range(30):
-        dst_even = k * 2 * PROGRAM_SIZE
-        dst_odd  = (k * 2 + 1) * PROGRAM_SIZE
-        result[dst_even:dst_even + PROGRAM_SIZE] = even_data[k * PROGRAM_SIZE:(k + 1) * PROGRAM_SIZE]
-        result[dst_odd:dst_odd + PROGRAM_SIZE]   = odd_data[k * PROGRAM_SIZE:(k + 1) * PROGRAM_SIZE]
-    return bytes(result)
+    even_stream = bytes(data[i] for i in range(0, expected, 2))  # progs 0–29
+    odd_stream  = bytes(data[i] for i in range(1, expected, 2))  # progs 30–59
+    return even_stream + odd_stream
 
 
 def program_name(slot_data: bytes) -> str:
