@@ -294,6 +294,72 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
     Ok(out)
 }
 
+/// Reverse of `allsequences_to_disk`: reconstruct an AllSequences SysEx payload
+/// from the SD-1 on-disk SixtySequences format.
+///
+/// On-disk layout (no programs):
+///   [0..11280]   – 60 × 188-byte sequence headers
+///   [11280..11301] – 21-byte global section
+///   [11301..11776] – zeros
+///   [11776..]    – sequence event data (each sequence block-padded to 512 bytes)
+///
+/// On-disk layout (with embedded programs, `has_programs = true`):
+///   same header/global prefix, seq data starts at 44032 instead of 11776.
+///
+/// Reconstructed SysEx AllSequences payload layout:
+///   [0..240]           – 240 zero bytes (internal ptr table; SD-1 rebuilds from headers)
+///   [240..252]         – 12 zero bytes  (SD-1-internal event header; not stored on disk)
+///   [252..252+N]       – packed sequence event data (N = sum of each sequence's ds)
+///   [252+N..252+N+11280] – 60 × 188-byte sequence headers
+///   [252+N+11280..]    – 21-byte global section
+pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> {
+    const HEADER_SIZE: usize = 188;
+    const HEADER_COUNT: usize = 60;
+    const HEADERS_TOTAL: usize = HEADER_SIZE * HEADER_COUNT; // 11280
+    const GLOBAL_SIZE: usize = 21;
+    const GLOBAL_DISK_START: usize = HEADERS_TOTAL;          // 11280
+    const GLOBAL_DISK_END: usize = GLOBAL_DISK_START + GLOBAL_SIZE; // 11301
+    const SEQ_DATA_NO_PROGRAMS: usize = 11776;
+    const SEQ_DATA_WITH_PROGRAMS: usize = 44032;
+    const BLOCK_SIZE: usize = 512;
+    const PTR_TABLE_SIZE: usize = 240;
+    const EVENT_LEAD_ZEROS: usize = 12;
+
+    let min_size = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
+    if disk.len() < min_size {
+        return Err(Error::InvalidSysEx("on-disk SixtySequences data too short"));
+    }
+
+    let headers_sec = &disk[..HEADERS_TOTAL];
+    let global_sec = &disk[GLOBAL_DISK_START..GLOBAL_DISK_END];
+    let seq_data_offset = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
+
+    // Unpack per-sequence event data, removing block padding.
+    let mut packed_events: Vec<u8> = Vec::new();
+    let mut in_pos = seq_data_offset;
+    for slot in 0..HEADER_COUNT {
+        let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        if ds == 0 { continue; }
+        if in_pos + ds > disk.len() {
+            return Err(Error::InvalidSysEx("on-disk SixtySequences: sequence data out of bounds"));
+        }
+        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds]);
+        in_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+    }
+
+    // Reconstruct AllSequences SysEx payload.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; PTR_TABLE_SIZE]);  // ptr table (zeroed; SD-1 rebuilds)
+    payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]); // SD-1-internal event header
+    payload.extend_from_slice(&packed_events);
+    payload.extend_from_slice(headers_sec);
+    payload.extend_from_slice(global_sec);
+
+    Ok(payload)
+}
+
 /// Reverse of `interleave_sixty_programs`: convert on-disk SixtyPrograms data back
 /// to the AllPrograms SysEx payload order (programs 0,1,2,...,59 in sequence).
 ///
@@ -451,6 +517,57 @@ mod tests {
     #[test]
     fn allsequences_to_disk_rejects_short_payload() {
         let result = allsequences_to_disk(&[0u8; 100], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn disk_to_allsequences_round_trips_via_disk() {
+        // Build the same minimal payload as allsequences_to_disk_layout:
+        // one defined sequence (slot 0, ds=170), 59 zero-ds slots, no programs.
+        const HEADER_COUNT: usize = 60;
+        const HEADER_SIZE: usize = 188;
+        const HEADERS_TOTAL: usize = HEADER_COUNT * HEADER_SIZE;
+        const SEQ_DATA_LEN: usize = 170;
+        const GLOBAL_SIZE: usize = 21;
+        const EVENT_LEAD: usize = 12;
+
+        let size_sum: u32 = SEQ_DATA_LEN as u32 + 0xFC;
+        let mut headers = vec![0u8; HEADERS_TOTAL];
+        headers[183] = 0; headers[184] = 0; headers[185] = SEQ_DATA_LEN as u8;
+
+        let seq_bytes: Vec<u8> = (0..SEQ_DATA_LEN as u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 240]);
+        payload.extend_from_slice(&[0u8; EVENT_LEAD]);
+        payload.extend_from_slice(&seq_bytes);
+        payload.extend_from_slice(&headers);
+        let mut global = [0u8; GLOBAL_SIZE];
+        global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+        payload.extend_from_slice(&global);
+
+        // Convert to disk format.
+        let disk = allsequences_to_disk(&payload, None).unwrap();
+
+        // Convert back to SysEx payload.
+        let recovered = disk_to_allsequences(&disk, false).unwrap();
+
+        // Round-trip: converting the recovered payload back to disk should
+        // produce identical bytes (modulo the 240-byte ptr table which is
+        // discarded on write and zeroed on reconstruct — both payloads have
+        // zeros there, so the disk output must match exactly).
+        let disk2 = allsequences_to_disk(&recovered, None).unwrap();
+        assert_eq!(disk, disk2, "disk→payload→disk round-trip must be lossless");
+
+        // The recovered payload must carry the original event data at the
+        // correct position: after 240 ptr-table bytes + 12 lead zeros.
+        let event_start = 240 + EVENT_LEAD;
+        assert_eq!(&recovered[event_start..event_start + SEQ_DATA_LEN], seq_bytes.as_slice(),
+            "recovered event data must match original");
+    }
+
+    #[test]
+    fn disk_to_allsequences_rejects_short_disk() {
+        let result = disk_to_allsequences(&[0u8; 100], false);
         assert!(result.is_err());
     }
 

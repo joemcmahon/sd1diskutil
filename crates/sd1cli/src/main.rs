@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
-    block1_entries, block1_find,
+    disk_to_allsequences, block1_entries, block1_find,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -396,15 +396,25 @@ fn cmd_extract(
 ) -> sd1disk::Result<()> {
     let img = DiskImage::open(image_path)?;
 
-    let entry = (0..4u8)
-        .find_map(|i| SubDirectory::new(i).find(&img, name))
-        .or_else(|| block1_find(&img, name))
+    // Track whether the file came from the VST3 block-1 directory (contiguous) or a
+    // standard subdirectory (FAT-chained). VST3-managed files must not use FAT traversal
+    // because the SD-1 hardware format overlays directory data on top of the FAT blocks.
+    let (entry, use_contiguous) = (0..4u8)
+        .find_map(|i| SubDirectory::new(i).find(&img, name).map(|e| (e, false)))
+        .or_else(|| block1_find(&img, name).map(|e| (e, true)))
         .ok_or_else(|| sd1disk::Error::FileNotFound(name.to_string()))?;
 
-    let chain = FileAllocationTable::chain(&img, entry.first_block as u16)?;
     let mut raw = Vec::new();
-    for &b in &chain {
-        raw.extend_from_slice(img.block(b)?);
+    if use_contiguous {
+        let start = entry.first_block as u16;
+        for b in start..start + entry.size_blocks {
+            raw.extend_from_slice(img.block(b)?);
+        }
+    } else {
+        let chain = FileAllocationTable::chain(&img, entry.first_block as u16)?;
+        for &b in &chain {
+            raw.extend_from_slice(img.block(b)?);
+        }
     }
     raw.truncate(entry.size_bytes as usize);
 
@@ -420,8 +430,18 @@ fn cmd_extract(
             SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, model: 0, payload }
                 .to_bytes(channel)
         }
-        FileType::OneSequence | FileType::ThirtySequences | FileType::SixtySequences => {
+        FileType::OneSequence | FileType::ThirtySequences => {
             Sequence::from_bytes(&raw).to_sysex(channel).to_bytes(channel)
+        }
+        FileType::SixtySequences => {
+            let has_programs = entry.type_info & 0x20 != 0;
+            let payload = disk_to_allsequences(&raw, has_programs)?;
+            sd1disk::sysex::SysExPacket {
+                message_type: sd1disk::MessageType::AllSequences,
+                midi_channel: channel,
+                model: 0,
+                payload,
+            }.to_bytes(channel)
         }
         _ => return Err(sd1disk::Error::InvalidSysEx("unsupported file type for extract")),
     };
