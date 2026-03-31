@@ -15,3 +15,6 @@ pub use sysex::{MessageType, SysExPacket};
 
 pub mod types;
 pub use types::{Program, Preset, Sequence, interleave_sixty_programs, deinterleave_sixty_programs, allsequences_to_disk, disk_to_allsequences};
+
+pub mod hfe;
+pub use hfe::{read_hfe, write_hfe};
