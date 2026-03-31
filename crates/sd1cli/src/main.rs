@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
-    disk_to_allsequences, block1_entries, block1_find,
+    disk_to_allsequences, block1_entries, block1_find, read_hfe, write_hfe,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -128,6 +128,37 @@ The image can be written to a floppy disk with a tool such as `dd`.")]
         /// Path where the new disk image will be written
         image: PathBuf,
     },
+    /// Convert an HFE flux image to a flat .img disk image
+    #[command(name = "hfe-to-img", long_about = "\
+Convert an HFE v1 flux image file to a flat SD-1 .img disk image.
+
+Reads the HFE file, decodes the MFM bitstream for all 80 tracks × 2 sides × 10
+sectors, verifies CRC16-CCITT for every sector, and writes the resulting 819,200-byte
+flat image.
+
+Fails with a descriptive error on bad signature, unsupported HFE revision, CRC
+mismatch, or missing sector.")]
+    HfeToImg {
+        /// Path to the input HFE file
+        hfe: PathBuf,
+        /// Path for the output .img disk image
+        img: PathBuf,
+    },
+    /// Convert a flat .img disk image to an HFE flux image
+    #[command(name = "img-to-hfe", long_about = "\
+Convert a flat SD-1 .img disk image to an HFE v1 flux image file.
+
+Encodes all 80 tracks × 2 sides × 10 sectors as MFM bitstream with correct
+CRC16-CCITT checksums, interleaves the sides, and writes an HFE v1 file that
+works with the HxC floppy emulator and the Sojus VST3 plugin.
+
+Uses atomic write (writes to .hfe.tmp then renames).")]
+    ImgToHfe {
+        /// Path to the input .img disk image
+        img: PathBuf,
+        /// Path for the output HFE file
+        hfe: PathBuf,
+    },
     /// Parse and display contents of a SysEx file
     #[command(name = "inspect-sysex", long_about = "\
 Parse a SysEx (.syx) file and display its contents.
@@ -160,6 +191,8 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
             cmd_extract(&image, &name, out.as_deref(), channel),
         Command::Delete { image, name } => cmd_delete(&image, &name),
         Command::Create { image } => cmd_create(&image),
+        Command::HfeToImg { hfe, img } => cmd_hfe_to_img(&hfe, &img),
+        Command::ImgToHfe { img, hfe } => cmd_img_to_hfe(&img, &hfe),
         Command::InspectSysex { sysex } => cmd_inspect_sysex(&sysex),
     }
 }
@@ -467,6 +500,20 @@ fn cmd_delete(image_path: &Path, name: &str) -> sd1disk::Result<()> {
     img.save(image_path)?;
 
     println!("Deleted: {} ({} block(s) freed)", name, freed);
+    Ok(())
+}
+
+fn cmd_hfe_to_img(hfe_path: &Path, img_path: &Path) -> sd1disk::Result<()> {
+    let img = read_hfe(hfe_path)?;
+    img.save(img_path)?;
+    println!("Converted: {} -> {}", hfe_path.display(), img_path.display());
+    Ok(())
+}
+
+fn cmd_img_to_hfe(img_path: &Path, hfe_path: &Path) -> sd1disk::Result<()> {
+    let img = DiskImage::open(img_path)?;
+    write_hfe(&img, hfe_path)?;
+    println!("Converted: {} -> {}", img_path.display(), hfe_path.display());
     Ok(())
 }
 
