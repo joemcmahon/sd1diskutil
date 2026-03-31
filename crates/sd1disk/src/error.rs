@@ -26,6 +26,12 @@ pub enum Error {
     BadBlockInChain(u16),
     /// Name exceeds 11 bytes or contains unrepresentable characters
     InvalidName(String),
+    /// HFE file has a bad or unsupported header
+    InvalidHfe(&'static str),
+    /// CRC mismatch detected while decoding an HFE sector
+    HfeCrcMismatch { track: u8, side: u8, sector: u8 },
+    /// A sector was not found in the HFE track data
+    HfeMissingSector { track: u8, side: u8, sector: u8 },
     /// I/O error from std
     Io(std::io::Error),
 }
@@ -53,6 +59,13 @@ impl fmt::Display for Error {
             Error::InvalidName(name) => {
                 write!(f, "Invalid file name '{}': must be 1–11 ASCII bytes", name)
             }
+            Error::InvalidHfe(msg) => write!(f, "Invalid HFE file: {}", msg),
+            Error::HfeCrcMismatch { track, side, sector } => write!(
+                f, "HFE CRC mismatch at track {} side {} sector {}", track, side, sector
+            ),
+            Error::HfeMissingSector { track, side, sector } => write!(
+                f, "HFE missing sector at track {} side {} sector {}", track, side, sector
+            ),
             Error::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -98,5 +111,18 @@ mod tests {
         let e = Error::FileNotFound("MY_PATCH".to_string());
         let s = format!("{}", e);
         assert!(s.contains("MY_PATCH"));
+    }
+
+    #[test]
+    fn hfe_errors_display() {
+        let e = Error::InvalidHfe("bad signature");
+        assert!(format!("{}", e).contains("bad signature"));
+
+        let e = Error::HfeCrcMismatch { track: 3, side: 1, sector: 7 };
+        let s = format!("{}", e);
+        assert!(s.contains("3") && s.contains("1") && s.contains("7"));
+
+        let e = Error::HfeMissingSector { track: 0, side: 0, sector: 5 };
+        assert!(format!("{}", e).contains("5"));
     }
 }
