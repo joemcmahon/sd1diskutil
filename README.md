@@ -6,6 +6,9 @@ Supports reading, writing, extracting, and deleting Programs, Presets, and
 Sequences stored on SD-1 floppy disk images. Files are transferred in MIDI
 SysEx format, compatible with hardware sysex librarians and DAWs.
 
+Also supports HFE v1 flux image format, used by the HxC floppy emulator and
+the Sojus VST3 plugin. See [HFE format and the Sojus MAME bug](#hfe-format-and-the-sojus-mame-bug).
+
 ---
 
 ## Contents
@@ -19,6 +22,9 @@ SysEx format, compatible with hardware sysex librarians and DAWs.
   - [extract](#extract)
   - [delete](#delete)
   - [create](#create)
+  - [hfe-to-img](#hfe-to-img)
+  - [img-to-hfe](#img-to-hfe)
+- [HFE format and the Sojus MAME bug](#hfe-format-and-the-sojus-mame-bug)
 - [SD-1 disk format overview](#sd-1-disk-format-overview)
 - [Supported file types](#supported-file-types)
 - [Known limitations](#known-limitations)
@@ -65,6 +71,12 @@ sd1cli delete my_sounds.img MYPROG
 
 # Create a new blank disk image
 sd1cli create new_disk.img
+
+# Convert a flat .img to HFE (for use with HxC emulator or Sojus VST3)
+sd1cli img-to-hfe my_sounds.img my_sounds.hfe
+
+# Convert an HFE back to a flat .img
+sd1cli hfe-to-img my_sounds.hfe my_sounds.img
 ```
 
 ---
@@ -223,6 +235,81 @@ dd if=/tmp/new_disk.img of=/dev/rdisk2 bs=512
 
 ---
 
+### hfe-to-img
+
+```
+sd1cli hfe-to-img <HFE> <IMG>
+```
+
+Converts an HFE v1 flux image to a flat SD-1 `.img` disk image. Decodes the MFM
+bitstream for all 80 tracks × 2 sides × 10 sectors and verifies CRC16-CCITT for
+every sector. Fails with a descriptive error on bad signature, unsupported HFE
+revision, CRC mismatch, or missing sector.
+
+**Example:**
+
+```sh
+sd1cli hfe-to-img my_sounds.hfe my_sounds.img
+```
+
+---
+
+### img-to-hfe
+
+```
+sd1cli img-to-hfe <IMG> <HFE>
+```
+
+Converts a flat SD-1 `.img` disk image to HFE v1 flux format. Encodes all 80
+tracks × 2 sides × 10 sectors as MFM bitstream with correct CRC16-CCITT
+checksums. The output is compatible with the HxC floppy emulator and the Sojus
+VST3 plugin. Uses atomic write (writes to `.hfe.tmp` then renames).
+
+**Example:**
+
+```sh
+sd1cli img-to-hfe my_sounds.img my_sounds.hfe
+```
+
+---
+
+## HFE format and the Sojus MAME bug
+
+[HFE](https://hxc2001.com/download/floppy_drive_emulator/SDCard_HxC_Floppy_Emulator_HFE_file_format.pdf)
+is a raw MFM flux image format used by the HxC floppy emulator family and the
+Sojus VST3 plugin. Instead of cooked sectors, it stores the actual bitstream the
+read head would encounter — flux transitions encoded as ones and zeros, with full
+MFM encoding and CRC fields intact.
+
+### Why HFE matters: the Sojus MAME bug
+
+The Sojus VST3 plugin emulates the SD-1's floppy drive via MAME. When saving a
+`.img` file, Sojus routes writes through MAME's `get_track_data_mfm_pc`, which
+expects PC-standard sector numbering (sectors 1–10). The Ensoniq SD-1 uses
+sectors 0–9. MAME silently discards sector 0 of every track, shifts the
+remaining sectors down by one position, and zeros the last sector per track.
+
+On a 160-track SD-1 disk, this corrupts every tenth block (blocks 0, 10, 20,
+…). **The data in those sectors is gone and cannot be recovered.** A disk image
+written by Sojus that appears to load correctly may have silent data corruption
+in its first sector of every track.
+
+**HFE files written by Sojus are not affected** — the raw bitstream bypasses
+MAME's sector extraction entirely.
+
+### Recommended workflow with Sojus
+
+1. Prepare your disk as a flat `.img` using `sd1cli` write/delete/create commands.
+2. Convert to HFE: `sd1cli img-to-hfe my_sounds.img my_sounds.hfe`
+3. Load `my_sounds.hfe` into the Sojus plugin.
+4. After saving files from the synth, convert back: `sd1cli hfe-to-img my_sounds.hfe my_sounds.img`
+5. Use `sd1cli list` to verify the saved files appear correctly.
+
+Do not use `.img` files as the live working copy inside Sojus. Always use HFE
+as the interchange format between `sd1diskutil` and the plugin.
+
+---
+
 ## SD-1 disk format overview
 
 SD-1 disks are 800 KB double-density floppy images (1600 blocks × 512 bytes).
@@ -263,8 +350,6 @@ Names are compared case-insensitively by the utility.
 
 ## Known limitations
 
-These are documented post-v0.1 gaps:
-
 - **Preset names:** Presets have no accessible name field in the on-disk format;
   `list` shows the directory entry name, not an internal patch name.
 - **`--dir` capacity check:** if the specified sub-directory is full, the error
@@ -273,6 +358,11 @@ These are documented post-v0.1 gaps:
   Swift API.
 - **No `dd` wrapper:** writing images to physical floppy disks requires an
   external tool (`dd`, `balenaEtcher`, etc.).
+- **HFE v1 only:** HFE v2 and v3 use a different container format and are not
+  supported. All SD-1 HFE files produced by Sojus and HxC emulators are v1.
+- **Sojus-corrupted `.img` repair:** `.img` files already damaged by the Sojus
+  MAME bug cannot be repaired — sector 0 data is unrecoverable. Use HFE going
+  forward.
 
 ## LCD character set vs ASCII
 
