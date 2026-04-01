@@ -227,14 +227,13 @@ fn encode_track_side(img: &DiskImage, track: u8, side: u8) -> Vec<u8> {
     // Compute fixed encoded size to determine gap3 size.
     // Each decoded byte → 2 HFE bytes. A1* marks → 2 bytes each (already raw).
     //
-    // Per sector fixed content (before gap3):
-    //   sync(12) + 3×A1*(6) + IDAM(7) + gap2(22) + sync(12) + 3×A1*(6) + DAM(515)
-    //   = 12 + 6 + 7 + 22 + 12 + 6 + 515 = 580 decoded bytes → 1160 encoded bytes
-    // Preamble: gap4a(80) + sync(12) + gap1(50) = 142 decoded bytes → 284 encoded bytes
-    // Total fixed = 284 + 10 × 1160 = 284 + 11600 = 11884 encoded bytes
-    // Remaining for gap3s: SIDE_LEN - 11884 = 638 encoded bytes = 319 decoded bytes
-    // Gap3 per sector: 319 / 10 = 31 decoded bytes (each → 2 encoded = 62 encoded bytes per sector)
-    // But spec says ~75 × 0x4E: we compute dynamically.
+    // Per sector fixed content (encoded bytes, before gap3):
+    //   sync(12×2=24) + 3×A1*(3×2=6) + IDAM(7×2=14) + gap2(22×2=44)
+    //   + sync(12×2=24) + 3×A1*(3×2=6) + DAM(515×2=1030) = 1148 encoded bytes
+    // Preamble: gap4a(80×2=160) + sync(12×2=24) + gap1(50×2=100) = 284 encoded bytes
+    // Total fixed = 284 + 10×1148 = 11764 encoded bytes
+    // Remaining for gap3s: 12522 − 11764 = 758 encoded bytes across 10 sectors
+    // Base gap3: 758/10 = 75 encoded bytes per sector (last sector absorbs remainder)
 
     let preamble_decoded = GAP4A_COUNT + SYNC1_COUNT + GAP1_COUNT; // 142
     // Per sector: sync(12) + 3×A1(each=2raw) + idam(7) + gap2(22) + sync(12) + 3×A1 + dam(515)
@@ -541,7 +540,7 @@ pub fn write_hfe(image: &DiskImage, path: &Path) -> Result<()> {
     header[15] = 0x00;
     // interface mode at offset 16: 7 = GENERIC_SHUGART_DD
     header[16] = 0x07;
-    header[17] = 0x00;
+    header[17] = 0xFF; // dnu (do not use) — HFE v1 spec requires 0xFF
     // track list block at offset 18: block 1
     header[18] = 0x01;
     header[19] = 0x00;
