@@ -133,6 +133,13 @@ impl FileAllocationTable {
         };
         Self::write_raw(image, block, raw);
     }
+
+    /// Count free data blocks (blocks 23–1599).
+    pub fn count_free(image: &DiskImage) -> u32 {
+        (FIRST_DATA_BLOCK..TOTAL_BLOCKS)
+            .filter(|&b| Self::entry(image, b) == FatEntry::Free)
+            .count() as u32
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +252,32 @@ mod tests {
         FileAllocationTable::set_next(&mut img, 24, FatEntry::Next(23));
         let result = FileAllocationTable::chain(&img, 23);
         assert!(matches!(result, Err(crate::Error::CorruptFat)));
+    }
+
+    // ── count_free ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_free_on_blank_disk_equals_usable_block_count() {
+        let img = blank();
+        // 1600 blocks total; blocks 0–22 reserved; 1577 usable data blocks
+        assert_eq!(FileAllocationTable::count_free(&img), 1577);
+    }
+
+    #[test]
+    fn count_free_decreases_after_allocation() {
+        let mut img = blank();
+        // allocate returns candidate blocks; set_chain commits them to the FAT
+        let blocks = FileAllocationTable::allocate(&mut img, 10).unwrap();
+        FileAllocationTable::set_chain(&mut img, &blocks);
+        assert_eq!(FileAllocationTable::count_free(&img), 1577 - 10);
+    }
+
+    #[test]
+    fn count_free_increases_after_freeing_chain() {
+        let mut img = blank();
+        let blocks = FileAllocationTable::allocate(&mut img, 5).unwrap();
+        FileAllocationTable::set_chain(&mut img, &blocks);
+        FileAllocationTable::free_chain(&mut img, blocks[0]);
+        assert_eq!(FileAllocationTable::count_free(&img), 1577);
     }
 }

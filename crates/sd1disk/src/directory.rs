@@ -139,6 +139,21 @@ pub fn block1_find(image: &DiskImage, name: &str) -> Option<DirectoryEntry> {
     block1_entries(image).into_iter().find(|e| e.name_str() == name)
 }
 
+/// Return the next file_number to assign for a given file type.
+/// Counts all existing entries of that type across all 4 subdirectories.
+pub fn next_file_number(img: &DiskImage, file_type: &FileType) -> u8 {
+    (0..4u8)
+        .flat_map(|i| SubDirectory::new(i).entries(img))
+        .filter(|e| &e.file_type == file_type)
+        .count() as u8
+}
+
+/// Return the type_info byte for a directory entry.
+/// Only SixtySequences with embedded programs uses 0x20; everything else is 0x00.
+pub fn file_type_info(file_type: &FileType, programs_embedded: bool) -> u8 {
+    if *file_type == FileType::SixtySequences && programs_embedded { 0x20 } else { 0x00 }
+}
+
 /// Validate that a name fits in 11 bytes and is non-empty.
 /// Returns the name as a space-padded [u8; 11] array.
 pub fn validate_name(name: &str) -> Result<[u8; 11]> {
@@ -418,5 +433,93 @@ mod tests {
         img.data[offset..offset + SUBDIR_ENTRY_SIZE].copy_from_slice(e0);
         assert!(block1_find(&img, "MYFILE").is_some());
         assert!(block1_find(&img, "NOTHERE").is_none());
+    }
+
+    fn make_entry(file_type: FileType, name: &[u8; 11], file_number: u8) -> DirectoryEntry {
+        DirectoryEntry {
+            type_info: 0,
+            file_type,
+            name: *name,
+            _reserved: 0,
+            size_blocks: 1,
+            contiguous_blocks: 1,
+            first_block: 23,
+            file_number,
+            size_bytes: 512,
+        }
+    }
+
+    // ── next_file_number ─────────────────────────────────────────────────────
+
+    #[test]
+    fn next_file_number_is_zero_on_blank_disk() {
+        let img = blank();
+        assert_eq!(next_file_number(&img, &FileType::SixtySequences), 0);
+        assert_eq!(next_file_number(&img, &FileType::OneProgram), 0);
+    }
+
+    #[test]
+    fn next_file_number_counts_one_existing_file() {
+        let mut img = blank();
+        SubDirectory::new(0)
+            .add(&mut img, make_entry(FileType::SixtySequences, b"SEQS1      ", 0))
+            .unwrap();
+        assert_eq!(next_file_number(&img, &FileType::SixtySequences), 1);
+    }
+
+    #[test]
+    fn next_file_number_counts_across_all_subdirs() {
+        let mut img = blank();
+        SubDirectory::new(0)
+            .add(&mut img, make_entry(FileType::SixtySequences, b"SEQS1      ", 0))
+            .unwrap();
+        SubDirectory::new(1)
+            .add(&mut img, make_entry(FileType::SixtySequences, b"SEQS2      ", 1))
+            .unwrap();
+        assert_eq!(next_file_number(&img, &FileType::SixtySequences), 2);
+    }
+
+    #[test]
+    fn next_file_number_ignores_different_file_types() {
+        let mut img = blank();
+        SubDirectory::new(0)
+            .add(&mut img, make_entry(FileType::OneProgram, b"PROG1      ", 0))
+            .unwrap();
+        // OneProgram entry must not affect SixtySequences count
+        assert_eq!(next_file_number(&img, &FileType::SixtySequences), 0);
+        // And OneProgram count reflects existing entries
+        assert_eq!(next_file_number(&img, &FileType::OneProgram), 1);
+    }
+
+    // ── file_type_info ───────────────────────────────────────────────────────
+
+    #[test]
+    fn file_type_info_is_zero_for_all_normal_file_types() {
+        for ft in [
+            FileType::OneProgram,
+            FileType::SixtyPrograms,
+            FileType::OnePreset,
+            FileType::TwentyPresets,
+            FileType::OneSequence,
+            FileType::SixtySequences,
+        ] {
+            assert_eq!(
+                file_type_info(&ft, false), 0x00,
+                "expected 0x00 for {:?} without embedded programs", ft
+            );
+        }
+    }
+
+    #[test]
+    fn file_type_info_is_0x20_for_sequences_with_programs_embedded() {
+        assert_eq!(file_type_info(&FileType::SixtySequences, true), 0x20);
+    }
+
+    #[test]
+    fn file_type_info_ignores_embed_flag_for_non_sequence_types() {
+        // Only SixtySequences supports embedded programs; all others stay 0x00
+        assert_eq!(file_type_info(&FileType::OneProgram, true), 0x00);
+        assert_eq!(file_type_info(&FileType::SixtyPrograms, true), 0x00);
+        assert_eq!(file_type_info(&FileType::TwentyPresets, true), 0x00);
     }
 }

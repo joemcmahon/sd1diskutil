@@ -4,6 +4,7 @@ use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
     disk_to_allsequences, block1_entries, block1_find, read_hfe, write_hfe,
+    next_file_number, file_type_info,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -394,14 +395,13 @@ fn cmd_write(
         }
         FileAllocationTable::set_chain(&mut img, &blocks);
 
-        // type_info bit 5 (0x20) signals programs are embedded in a SixtySequences file.
-        // The SD-1 uses this bit to decide whether seq data is at 11776 (no programs)
-        // or at 44032 (60-programs variant). Bit 0x0F identifies the SixtySequences type.
-        let type_info = if matches!(file_type, FileType::SixtySequences) && embed_programs {
-            0x2F  // 0x20 (programs embedded) | 0x0F (SixtySequences bits)
-        } else {
-            0x0F
-        };
+        // type_info: bit 5 (0x20) signals programs are embedded in a SixtySequences file.
+        // All other bits are 0x00 (matches hardware/emulator-written entries).
+        let type_info = file_type_info(&file_type, embed_programs);
+        // file_number: each file type has its own sequential index (0, 1, 2, …).
+        // The emulator uses this to populate its file-selection list; duplicate
+        // file_numbers cause files to shadow each other and become invisible.
+        let file_number = next_file_number(&img, &file_type);
         let entry = DirectoryEntry {
             type_info,
             file_type,
@@ -410,13 +410,15 @@ fn cmd_write(
             size_blocks: n_blocks,
             contiguous_blocks: n_blocks,
             first_block: blocks[0] as u32,
-            file_number: 0,
+            file_number,
             size_bytes: data.len() as u32,
         };
         target_dir.add(&mut img, entry)?;
         println!("Written: {} ({} bytes, {} block(s))", file_name, data.len(), n_blocks);
     }
 
+    // Sync the OS block's free-block count with the actual FAT state.
+    img.set_free_blocks(FileAllocationTable::count_free(&img));
     img.save(image_path)?;
     Ok(())
 }
