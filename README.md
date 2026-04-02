@@ -3,11 +3,11 @@
 Command-line utility for managing Ensoniq SD-1 and VFXsd synthesizer disk images.
 
 Supports reading, writing, extracting, and deleting Programs, Presets, and
-Sequences stored on SD-1 floppy disk images. Files are transferred in MIDI
+Sequences stored on floppy disk images. Files are transferred in MIDI
 SysEx format, compatible with hardware sysex librarians and DAWs.
 
 Also supports HFE v1 flux image format, used by the HxC floppy emulator and
-the Sojus VST3 plugin. See [HFE format and the Sojus MAME bug, now being worked on for version 0.9.8](#hfe-format-and-the-sojus-mame-bug).
+the Sojus Records SD-1 VST3 plugin. See [HFE format and the MAME bug, now being worked on for version 0.9.8](#hfe-format-and-the-mame-bug).
 
 ---
 
@@ -273,15 +273,13 @@ sd1cli img-to-hfe my_sounds.img my_sounds.hfe
 
 ---
 
-## HFE format and the Sojus MAME bug
+## HFE format and the MAME bug
 
 [HFE](https://hxc2001.com/download/floppy_drive_emulator/SDCard_HxC_Floppy_Emulator_HFE_file_format.pdf)
 is a raw MFM flux image format used by the HxC floppy emulator family and the
 Sojus VST3 plugin. Instead of cooked sectors, it stores the actual bitstream the
 read head would encounter — flux transitions encoded as ones and zeros, with full
 MFM encoding and CRC fields intact.
-
-### Why HFE matters: the 0.9.7 MAME bug
 
 The 0.9.7 version of the SD-1 VST3 plugin emulates the SD-1's floppy drive via MAME. When saving a
 `.img` file, the emulator routes writes through MAME's `get_track_data_mfm_pc`, which
@@ -294,8 +292,8 @@ On a 160-track SD-1 disk, this corrupts every tenth block (blocks 0, 10, 20,
 written by MAME that appears to load correctly may nonetheless have silent data corruption
 in its first sector of every track.
 
-**HFE files written by the 0.9.7 version of the emulator are not affected** — the HFE raw bitstream bypasses
-MAME's sector extraction entirely; HFE images can be mounted, read, and written safely. 
+**HFE files written by MAME SD-1 emulator are *not* affected** — the HFE raw bitstream bypasses
+MAME's sector extraction entirely, so HFE images can be mounted, read, and written safely.
 
 Sojus Records is working on a workaround for MAME's mangling of the sectors and expects to
 have it ready for version 0.9.8; when the issue is fixed, we'll remove this section (but
