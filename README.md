@@ -1,6 +1,6 @@
 # sd1diskutil
 
-Command-line utility for managing Ensoniq SD-1 synthesizer disk images.
+Command-line utility for managing Ensoniq SD-1 and VFXsd synthesizer disk images.
 
 Supports reading, writing, extracting, and deleting Programs, Presets, and
 Sequences stored on SD-1 floppy disk images. Files are transferred in MIDI
