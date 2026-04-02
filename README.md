@@ -7,7 +7,7 @@ Sequences stored on floppy disk images. Files are transferred in MIDI
 SysEx format, compatible with hardware sysex librarians and DAWs.
 
 Also supports HFE v1 flux image format, used by the HxC floppy emulator and
-the Sojus Records SD-1 VST3 plugin. See [HFE format and the MAME bug, now being worked on for version 0.9.8](#hfe-format-and-the-mame-bug).
+the Sojus Records SD-1 VST3 plugin. See [HFE format and pre-0.9.8 disk write bug](#hfe-format-and-the-mame-bug) for version compatibility notes.
 
 ---
 
@@ -24,7 +24,7 @@ the Sojus Records SD-1 VST3 plugin. See [HFE format and the MAME bug, now being 
   - [create](#create)
   - [hfe-to-img](#hfe-to-img)
   - [img-to-hfe](#img-to-hfe)
-- [HFE format and the MAME bug](#hfe-format-and-the-mame-bug)
+- [HFE format and pre-0.9.8 disk write bug](#hfe-format-and-pre-0.9.8-disk-write-bug)
 - [SD-1 disk format overview](#sd-1-disk-format-overview)
 - [Supported file types](#supported-file-types)
 - [Known limitations](#known-limitations)
@@ -41,7 +41,7 @@ cd sd1diskutil
 cargo build --release
 ```
 
-The binary is placed at `./target/release/sd1cli`.
+The binary is created at `./target/release/sd1cli`.
 
 Copy it to a location on your `PATH`:
 
@@ -120,7 +120,7 @@ sd1cli inspect <IMAGE>
 Shows disk metadata without modifying the image: path, free block counts, and
 a File Allocation Table (FAT) summary (free / used / bad blocks).
 
-> **Note:** The OS-block free count may read `0` on images written by hardware.
+> **Note:** The OS-block free count may read `0` on images written by hardware or the SD-1 emulator.
 > The FAT-derived count is always accurate.
 
 **Example:**
@@ -226,12 +226,6 @@ Creates a new blank SD-1 disk image (819,200 bytes — 1600 × 512-byte blocks)
 pre-formatted with SD-1 OS structures. Blocks 0–22 are reserved; blocks 23–1599
 are available for files.
 
-The image can be written to a physical floppy disk with a tool such as `dd`:
-
-```sh
-sd1cli create /tmp/new_disk.img
-dd if=/tmp/new_disk.img of=/dev/rdisk2 bs=512
-```
 
 ---
 
@@ -273,7 +267,7 @@ sd1cli img-to-hfe my_sounds.img my_sounds.hfe
 
 ---
 
-## HFE format and the MAME bug
+## HFE format and pre-0.9.8 disk write bug
 
 [HFE](https://hxc2001.com/download/floppy_drive_emulator/SDCard_HxC_Floppy_Emulator_HFE_file_format.pdf)
 is a raw MFM flux image format used by the HxC floppy emulator family and the
@@ -281,37 +275,46 @@ Sojus VST3 plugin. Instead of cooked sectors, it stores the actual bitstream the
 read head would encounter — flux transitions encoded as ones and zeros, with full
 MFM encoding and CRC fields intact.
 
-The 0.9.7 version of the SD-1 VST3 plugin emulates the SD-1's floppy drive via MAME. When saving a
-`.img` file, the emulator routes writes through MAME's `get_track_data_mfm_pc`, which
-expects PC-standard sector numbering (sectors 1–10). The Ensoniq SD-1 uses
-sectors 0–9. Because of this mismatch, MAME silently discards sector 0 of every track, shifts the
-remaining sectors down by one position, and zeros the last sector per track.
+**Version 0.9.8 and later of the Sojus SD-1 VST3 plugin handle `.img` files
+correctly.** You can use flat `.img` files directly with the plugin — no HFE
+conversion needed. If you are already using HFE files and prefer to continue
+doing so, that is equally safe, though less convenient.
 
-On a 160-track SD-1 disk, this corrupts every tenth block (blocks 0, 10, 20,
-…). **The data in those sectors is gone and cannot be recovered.** A disk image
-written by MAME that appears to load correctly may nonetheless have silent data corruption
-in its first sector of every track.
+**Version 0.9.7 and earlier** had a sector-numbering mismatch in the MAME floppy
+backend. When saving a `.img` file, the emulator routed writes through MAME's
+`get_track_data_mfm_pc`, which expects PC-standard sector numbering (sectors 1–10),
+while the Ensoniq SD-1 uses sectors 0–9. MAME silently discarded sector 0 of
+every track, shifted the remaining sectors down by one, and zeroed the last
+sector per track.
 
-**HFE files written by MAME SD-1 emulator are *not* affected** — the HFE raw bitstream bypasses
-MAME's sector extraction entirely, so HFE images can be mounted, read, and written safely.
+On a 160-track SD-1 disk this corrupted every tenth block (blocks 0, 10, 20, …).
 
-Sojus Records is working on a workaround for MAME's mangling of the sectors and expects to
-have it ready for version 0.9.8; when the issue is fixed, we'll remove this section (but
-keep HFE support).
+**Data in those sectors is unrecoverable.**
+
+HFE files written by the 0.9.7
+emulator were *not* affected — the HFE raw bitstream bypasses MAME's sector
+extraction entirely.
 
 ### Recommended workflow with the SD-1 emulator VST3
+
+#### Version 0.9.8 and later
+
+`.img` files work correctly with the plugin. Use `sd1cli` directly:
+
+1. Use `sd1cli` write/delete/create commands to manage your `.img` file.
+2. Load the `.img` directly into the SD-1 plugin.
+3. Do any disk operations you please in the SD-1 emulator.
+4. After saving files from the plugin, use `sd1cli list` to verify.
+
+#### Version 0.9.7 and earlier
+
+Do **not** use `.img` files as the live working copy in the plugin. Always use an HFE *copy* as the interchange format:
 
 1. Prepare your disk as a flat `.img` using `sd1cli` write/delete/create commands.
 2. Convert to HFE: `sd1cli img-to-hfe my_sounds.img my_sounds.hfe`
 3. Load `my_sounds.hfe` into the SD-1 plugin.
 4. After saving files from the plugin, convert back: `sd1cli hfe-to-img my_sounds.hfe my_sounds.img`
 5. Use `sd1cli list` to verify the saved files appear correctly.
-
-Do not use `.img` files as the live working copy inside the 0.9.7 or earlier SD-1 VST. Always use HFE
-as the interchange format between `sd1diskutil` and the plugin for that version or earlier!
-
-Once the plugin's MAME disk handling is corrected, we'll remove the HFE wrapping process in these instructions as it will no longer
-be necessary to use HFE format to safely save files in the emulator.
 
 ---
 
@@ -367,9 +370,9 @@ We do not currently support copying the sequencer OS, but it would be easy to ad
   external tool (`dd`, `balenaEtcher`, etc.).
 - **HFE v1 only:** HFE v2 and v3 use a different container format and are not
   supported. All SD-1 HFE files produced by Sojus and HxC emulators are v1.
-- **Sojus-corrupted `.img` repair:** `.img` files already damaged by the Sojus
-  MAME bug cannot be repaired — sector 0 data is unrecoverable. Use HFE going
-  forward.
+- **Sojus-corrupted `.img` repair:** `.img` files already damaged by the 0.9.7
+  MAME sector-numbering bug cannot be repaired — sector 0 data is unrecoverable.
+  Upgrade to 0.9.8 or later and use a fresh image going forward.
 
 ## LCD character set vs ASCII
 
