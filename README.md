@@ -7,7 +7,7 @@ Sequences stored on SD-1 floppy disk images. Files are transferred in MIDI
 SysEx format, compatible with hardware sysex librarians and DAWs.
 
 Also supports HFE v1 flux image format, used by the HxC floppy emulator and
-the Sojus VST3 plugin. See [HFE format and the Sojus MAME bug](#hfe-format-and-the-sojus-mame-bug).
+the Sojus VST3 plugin. See [HFE format and the Sojus MAME bug, now being worked on for version 0.9.8](#hfe-format-and-the-sojus-mame-bug).
 
 ---
 
@@ -281,32 +281,39 @@ Sojus VST3 plugin. Instead of cooked sectors, it stores the actual bitstream the
 read head would encounter — flux transitions encoded as ones and zeros, with full
 MFM encoding and CRC fields intact.
 
-### Why HFE matters: the Sojus MAME bug
+### Why HFE matters: the 0.9.7 MAME bug
 
-The Sojus VST3 plugin emulates the SD-1's floppy drive via MAME. When saving a
-`.img` file, Sojus routes writes through MAME's `get_track_data_mfm_pc`, which
+The 0.9.7 version of the SD-1 VST3 plugin emulates the SD-1's floppy drive via MAME. When saving a
+`.img` file, the emulator routes writes through MAME's `get_track_data_mfm_pc`, which
 expects PC-standard sector numbering (sectors 1–10). The Ensoniq SD-1 uses
-sectors 0–9. MAME silently discards sector 0 of every track, shifts the
+sectors 0–9. Because of this mismatch, MAME silently discards sector 0 of every track, shifts the
 remaining sectors down by one position, and zeros the last sector per track.
 
 On a 160-track SD-1 disk, this corrupts every tenth block (blocks 0, 10, 20,
 …). **The data in those sectors is gone and cannot be recovered.** A disk image
-written by Sojus that appears to load correctly may have silent data corruption
+written by MAME that appears to load correctly may nonetheless have silent data corruption
 in its first sector of every track.
 
-**HFE files written by Sojus are not affected** — the raw bitstream bypasses
-MAME's sector extraction entirely.
+**HFE files written by the 0.9.7 version of the emulator are not affected** — the HFE raw bitstream bypasses
+MAME's sector extraction entirely; HFE images can be mounted, read, and written safely. 
 
-### Recommended workflow with Sojus
+Sojus Records is working on a workaround for MAME's mangling of the sectors and expects to
+have it ready for version 0.9.8; when the issue is fixed, we'll remove this section (but
+keep HFE support).
+
+### Recommended workflow with the SD-1 emulator VST3
 
 1. Prepare your disk as a flat `.img` using `sd1cli` write/delete/create commands.
 2. Convert to HFE: `sd1cli img-to-hfe my_sounds.img my_sounds.hfe`
-3. Load `my_sounds.hfe` into the Sojus plugin.
-4. After saving files from the synth, convert back: `sd1cli hfe-to-img my_sounds.hfe my_sounds.img`
+3. Load `my_sounds.hfe` into the SD-1 plugin.
+4. After saving files from the plugin, convert back: `sd1cli hfe-to-img my_sounds.hfe my_sounds.img`
 5. Use `sd1cli list` to verify the saved files appear correctly.
 
-Do not use `.img` files as the live working copy inside Sojus. Always use HFE
-as the interchange format between `sd1diskutil` and the plugin.
+Do not use `.img` files as the live working copy inside the 0.9.7 or earlier SD-1 VST. Always use HFE
+as the interchange format between `sd1diskutil` and the plugin for that version or earlier!
+
+Once the plugin's MAME disk handling is corrected, we'll remove the HFE wrapping process in these instructions as it will no longer
+be necessary to use HFE format to safely save files in the emulator.
 
 ---
 
@@ -345,6 +352,8 @@ Names are compared case-insensitively by the utility.
 | OnePreset | `OnePreset` | Single Preset (530 bytes payload) |
 | SingleSequence | `OneSequence` | Single Sequence |
 | AllSequences | `ThirtySequences` / `SixtySequences` | Full sequence bank |
+
+We do not currently support copying the sequencer OS, but it would be easy to add. Please file an issue if you want it.
 
 ---
 
