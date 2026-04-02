@@ -24,7 +24,7 @@ the Sojus Records SD-1 VST3 plugin. See [HFE format and the MAME bug, now being 
   - [create](#create)
   - [hfe-to-img](#hfe-to-img)
   - [img-to-hfe](#img-to-hfe)
-- [HFE format and the Sojus MAME bug](#hfe-format-and-the-sojus-mame-bug)
+- [HFE format and the MAME bug](#hfe-format-and-the-mame-bug)
 - [SD-1 disk format overview](#sd-1-disk-format-overview)
 - [Supported file types](#supported-file-types)
 - [Known limitations](#known-limitations)
