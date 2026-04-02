@@ -385,7 +385,41 @@ This means names that contain non-alphanumeric characters may look different
 in `sd1cli list` output than on the synthesizer's own screen. The on-disk bytes
 are stored and retrieved faithfully — the discrepancy is display-only.
 
-A future enhancement would be to map the SD-1's LCD character ROM to Unicode so
-that `list` can optionally render names as they appear on hardware. This would
-require testing file names covering all printable byte values against the hardware
-or a cycle-accurate emulator to build the full translation table.
+### Complete character map (tested against Sojus SD-1 emulator v0.9.8)
+
+Every byte value from `0x00` through `0xFF` has been tested by writing filenames
+containing each byte and observing the emulator display.
+
+**Bytes that render as blank (display nothing):**
+
+| Range | Notes |
+|-------|-------|
+| `0x00`–`0x1F` | Control characters |
+| `0x26` `&` | |
+| `0x2C` `,` | |
+| `0x3A` `:` | |
+| `0x3F` `?` | |
+| `0x60` `` ` `` | |
+| `0x61`–`0x7A` | Lowercase a–z |
+| `0x7B`–`0x7F` | `{`, `\|`, `}`, `~`, DEL |
+| `0x80`–`0xFF` | Entire upper half of byte range |
+
+**Bytes that render as digit-dot glyphs:**
+
+| Byte | ASCII char | Displays as |
+|------|-----------|------------|
+| `0x21` | `!` | `0.` |
+| `0x23` | `#` | `1.` |
+| `0x25` | `%` | `2.` |
+| `0x28` | `(` | `3.` |
+| `0x29` | `)` | `4.` |
+| `0x3B` | `;` | `6.` |
+| `0x5C` | `\` | `8.` |
+
+The glyphs `5.`, `7.`, and `9.` couldn't be rendered at any byte value; it's unknown as to whether they are renderable at all, but I was unable to find them by sweeping through all the possible 1-byte values.
+
+**All other bytes `0x20`–`0x5F` render as their standard ASCII equivalents.**
+This includes space, `!`–`/` (except those listed above), `0`–`9`, `A`–`Z`,
+and `[`, `]`, `^`, `_`.
+
+Non-alphanumerics other than space, /, -, +, -, and *, which can all be entered from the SD-1's interface, may look somewhat odd due to the limitations of the display (e.g., = renders as an underlined dash).
