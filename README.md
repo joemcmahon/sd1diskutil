@@ -422,4 +422,4 @@ The glyphs `5.`, `7.`, and `9.` couldn't be rendered at any byte value; it's unk
 This includes space, `!`–`/` (except those listed above), `0`–`9`, `A`–`Z`,
 and `[`, `]`, `^`, `_`.
 
-Non-alphanumerics other than space, /, -, +, -, and *, which can all be entered from the SD-1's interface, may look somewhat odd due to the limitations of the display (e.g., = renders as an underlined dash).
+Non-alphanumerics other than space, /, ., -, +, and *, which can all be entered from the SD-1's interface, may look somewhat odd due to the limitations of the display (e.g., = renders as an underlined dash).
