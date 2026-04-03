@@ -360,6 +360,122 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
     Ok(payload)
 }
 
+/// INT0 user bank: 10 banks × 6 patches, indexed by b10 value (0–59).
+pub const INT0_PROGRAMS: [&str; 60] = [
+    // bank 0
+    "ARTIC-ELATE", "OLYMPIANO",   "ALTO-SAX",    "MERLIN",       "WAY-FAT",     "GROOVE-KIT",
+    // bank 1
+    "ALLS-FAIR",   "IN-CONCERT",  "SOLOTRUMPET", "INSPIRED",     "AMEN-CHOIR",  "PASSION",
+    // bank 2
+    "SYMPHONY",    "MY-DESIRE",   "MUTED-HORNS", "STACK-BASS",   "DRAWBARS-1",  "SONOTAR",
+    // bank 3
+    "STRINGS",     "BRASS-STAB",  "MANDOLIN",    "CROWN-CHOIR",  "TUBULAR HIT", "JAZZ-KIT",
+    // bank 4
+    "STRUM-ME",    "LUNAR",       "BLUES-HARP",  "WIDEPUNCH",    "BRIGHT-PNO",  "PIPE-ORGAN1",
+    // bank 5
+    "MALLETS",     "SWEEPER",     "KOTO-DREAMS", "SWELL-SAW",    "WILBUR",      "MEATY-KIT",
+    // bank 6
+    "FIDDLE",      "PEDAL-STEEL", "BANJO-BANJO", "CLOCK-BELLS",  "THE-QUEEN",   "ROCK-KIT-2",
+    // bank 7
+    "SMOOTH-STRG", "DARK-HALL",   "GUITAR-PADS", "FANFARE",      "MINI-LEAD",   "NORM-1-KIT",
+    // bank 8
+    "STRATOS-VOX", "FUNKY-CLAV2", "COOL-FLUTES", "OH-BE-EX",     "DANCEBASS-2", "WOODY-PERC",
+    // bank 9
+    "ANNABELL",    "FUNK-GUITAR", "ELEC-BASS2",  "CLEAR-GUITAR", "STUDIO-CITY", "MEAN-KIT-1",
+];
+
+/// ROM program table: ROM0 (indices 0–59) then ROM1 (indices 60–119).
+/// Accessed as rom_index = (b10 & 0x7F) + 8.  Indices 0–7 are unreachable (enc < 0).
+pub const ROM_ALL_PROGRAMS: [&str; 120] = [
+    // ROM 0 — 60 programs (indices 0–59)
+    // bank 0
+    "ITS-A-SYNTH", "ZIRCONIUM",    " FAT-BRASS",   "STAR-DRIVE ", " WONDERS ",   "SAW-O-LIFE",
+    // bank 1
+    "DIGIPIANO-1", "NEW-PLANET",   " DANGEROUS ",  " FUNKYCLAV ", "WARM-TINES",  "METAL-TINES",
+    // bank 2
+    " BIG-PIANO ", "BRIGHT-PNO2",  " SYN-PIANO ",  "TRANS-PIANO", "CLASSIC-PNO", "HARPSICHORD",
+    // bank 3
+    "DOUBLE-REED", " TENOR-SAX ",  "WOODFLUTE",    " CHIFFLUTE ", "MALLET+FLTS", "FLUTE-VIL",
+    // bank 4
+    " STARBRASS ", " FRENCHORN ",  " TOP-BRASS ",  "FLUGEL-STRG", "  BRASSY  ",  "SYNTH-HORNS",
+    // bank 5
+    "SMAK-BASS",   "BEBOP-BASS",   "ELEC-BASS",    "SYNTHBASS",   "DANCE-BASS",  "BUZZ-BASS",
+    // bank 6
+    " ORGANIZER",  "NASTY-ORGAN",  "CATHEDRAL-1",  "TIMBRE-ORG",  "ANGELBREATH", " VERYBREATH",
+    // bank 7
+    "SWELLSTRNGS", " PIZZICATO ",  "LUSH-STRNGS",  "GOLDEN-HARP", "REZ-STRINGS", " ORCH+SOLO ",
+    // bank 8
+    "REEL-STEEL",  "SUN-N-MOON",   "FLANG-CLEAN",  " FUZZ-LEAD",  "SPANISH-GTR", " 12-STRING",
+    // bank 9
+    "KITCHN-SINK", "PERCUSSION",   "FUSION-KIT",   " BALLAD-KIT", "SYNTH-KIT",   "ROCKIN-KIT",
+    // ROM 1 — 60 programs (indices 60–119)
+    // bank 0
+    "OMNIVERSE",   "FLASH-BACK",   " SD1-PAD",     "SQUARE-PAD",  "NU-MEANING",  "ASCENSION",
+    // bank 1
+    "IN-DEMAND",   " FM-PIANO",    "MANY-ROADS",   "DEEP-TINES",  "PURE-TINE",   "INNOCENCE",
+    // bank 2
+    "STUDIO-GRND", " POP-GRND",    "JAZZ-GRAND",   "CHURCH-GRND", "CLASSIC-GND", "BOWS+GRAND",
+    // bank 3
+    "SOPRANO-SAX", " ALTO-SAX",    "BARI+HORNS",   "HARMONICA",   "SHAKUHACHI",  " PICCOLO +",
+    // bank 4
+    " ODYSSEY",    "MANY-LEADS",   " FUNK-LEAD",   "FUNKY-STABS", " CHICAGO",    "MUTED-HORN",
+    // bank 5
+    "MOOG-MUTE",   "  ANAREZO",    "PERKY-MOOG",   "CROSS-BASS",  "SLICK-ELEC",  "BLEACHBASS",
+    // bank 6
+    "JAZZ-ORGAN",  "DIRTY-ORGAN",  "NU-CHOIR",     "DIGITALIAN",  " CHORALE-2",  "90-S-VOX",
+    // bank 7
+    "DRAMA-STGS",  "NU-STRINGS",   "LUSH-STRG-2",  "  VIOLIN",    "   CELLO",    "  QUARTET",
+    // bank 8
+    "DREAM-GTR",   "JAZZ-GUITAR",  "ELEC-GUITAR",  "DIST-GTR",    "   NU-BEL",   " MULTI-BELL",
+    // bank 9
+    "DRUMS-MAP-R", "808-MAP-R",    "SLAM-MAP-R",   "MULTI-PERCS", "ORCH-PERKS",  " INDO-AFRO",
+];
+
+/// Decode a program name from a 530-byte program slot.
+///
+/// Masks the MSB of each name byte (the SD-1 uses high bits for mute flags),
+/// then strips trailing nulls and spaces.
+pub fn program_name_from_slot(slot_data: &[u8]) -> String {
+    let raw = &slot_data[PROGRAM_NAME_OFFSET..PROGRAM_NAME_OFFSET + PROGRAM_NAME_LEN];
+    let masked: Vec<u8> = raw.iter().map(|&b| b & 0x7F).collect();
+    let end = masked.iter().rposition(|&b| b != 0 && b != b' ')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    String::from_utf8_lossy(&masked[..end]).into_owned()
+}
+
+/// Decode a track program assignment byte (b10) to a human-readable label.
+///
+/// Encoding:
+/// - `0x00–0x3B` (0–59): RAM slot; resolved via `disk_programs` if provided,
+///   otherwise falls back to `INT0_PROGRAMS` (factory init bank).
+/// - `0x7F`: no program change on sequence recall.
+/// - `0x80–0xFE`: ROM program; `enc = b10 & 0x7F`, `rom_index = enc + 8`.
+/// - `0xFF`: track inactive.
+pub fn decode_b10(b10: u8, disk_programs: Option<&[String]>) -> String {
+    match b10 {
+        0xFF => "(inactive)".to_string(),
+        0x7F => "(no prog change)".to_string(),
+        0x00..=0x3B => {
+            let idx = b10 as usize;
+            let name = disk_programs
+                .and_then(|p| p.get(idx))
+                .map(|s| s.as_str())
+                .or_else(|| INT0_PROGRAMS.get(idx).copied())
+                .unwrap_or("?");
+            format!("RAM[{}]={}", idx, name)
+        }
+        b if b & 0x80 != 0 => {
+            let enc = b & 0x7F;
+            let rom_index = enc as usize + 8;
+            let bank_label = if rom_index < 60 { "ROM0" } else { "ROM1" };
+            let name = ROM_ALL_PROGRAMS.get(rom_index).copied().unwrap_or("?");
+            format!("{}[enc={}]={}", bank_label, enc, name)
+        }
+        other => format!("b10=0x{:02X}(?)", other),
+    }
+}
+
 /// Reverse of `interleave_sixty_programs`: convert on-disk SixtyPrograms data back
 /// to the AllPrograms SysEx payload order (programs 0,1,2,...,59 in sequence).
 ///
@@ -578,5 +694,103 @@ mod tests {
         let rebuilt_pkt = prog.to_sysex(0);
         let reparsed = Program::from_sysex(&rebuilt_pkt).unwrap();
         assert_eq!(reparsed.to_bytes(), prog.to_bytes());
+    }
+
+    // ── program_name_from_slot ────────────────────────────────────────────────
+
+    fn slot_with_name(name: &[u8; 11]) -> Vec<u8> {
+        let mut slot = vec![0u8; PROGRAM_SIZE];
+        slot[PROGRAM_NAME_OFFSET..PROGRAM_NAME_OFFSET + PROGRAM_NAME_LEN].copy_from_slice(name);
+        slot
+    }
+
+    #[test]
+    fn program_name_from_slot_trims_trailing_spaces() {
+        let slot = slot_with_name(b"COOL-FLUTES");
+        assert_eq!(program_name_from_slot(&slot), "COOL-FLUTES");
+    }
+
+    #[test]
+    fn program_name_from_slot_trims_trailing_nulls_and_spaces() {
+        let slot = slot_with_name(b"STRINGS    ");
+        assert_eq!(program_name_from_slot(&slot), "STRINGS");
+    }
+
+    #[test]
+    fn program_name_from_slot_masks_high_bits() {
+        // Name bytes with MSB set (SD-1 mute flags) should be masked to 7-bit ASCII
+        let mut name = *b"COOL-FLUTES";
+        name[0] |= 0x80; // 'C' with high bit set
+        let slot = slot_with_name(&name);
+        assert_eq!(program_name_from_slot(&slot), "COOL-FLUTES");
+    }
+
+    #[test]
+    fn program_name_from_slot_all_null_returns_empty() {
+        let slot = slot_with_name(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+        assert_eq!(program_name_from_slot(&slot), "");
+    }
+
+    #[test]
+    fn program_name_from_slot_preserves_internal_spaces() {
+        let slot = slot_with_name(b"TUBULAR HIT");
+        assert_eq!(program_name_from_slot(&slot), "TUBULAR HIT");
+    }
+
+    // ── decode_b10 ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_b10_inactive() {
+        assert_eq!(decode_b10(0xFF, None), "(inactive)");
+    }
+
+    #[test]
+    fn decode_b10_no_prog_change() {
+        assert_eq!(decode_b10(0x7F, None), "(no prog change)");
+    }
+
+    #[test]
+    fn decode_b10_ram_slot_0_fallback_to_int0() {
+        assert_eq!(decode_b10(0x00, None), "RAM[0]=ARTIC-ELATE");
+    }
+
+    #[test]
+    fn decode_b10_ram_slot_5_fallback_to_int0() {
+        assert_eq!(decode_b10(0x05, None), "RAM[5]=GROOVE-KIT");
+    }
+
+    #[test]
+    fn decode_b10_ram_last_slot_fallback_to_int0() {
+        assert_eq!(decode_b10(0x3B, None), "RAM[59]=MEAN-KIT-1");
+    }
+
+    #[test]
+    fn decode_b10_ram_uses_disk_programs_when_provided() {
+        let progs: Vec<String> = (0..60).map(|i| format!("MYPROG{:02}", i)).collect();
+        assert_eq!(decode_b10(0x03, Some(&progs)), "RAM[3]=MYPROG03");
+    }
+
+    #[test]
+    fn decode_b10_rom0_enc0() {
+        // b10=0x80: enc=0, rom_index=8, ROM0 → " DANGEROUS "
+        assert_eq!(decode_b10(0x80, None), "ROM0[enc=0]= DANGEROUS ");
+    }
+
+    #[test]
+    fn decode_b10_rom0_reel_steel() {
+        // REEL-STEEL is ROM0 bank8 patch0 → index 48 → enc = 48-8 = 40 → b10 = 0x80|40 = 0xA8
+        assert_eq!(decode_b10(0xA8, None), "ROM0[enc=40]=REEL-STEEL");
+    }
+
+    #[test]
+    fn decode_b10_rom1_first_entry() {
+        // ROM1 starts at index 60 → enc = 60-8 = 52 → b10 = 0x80|52 = 0xB4
+        assert_eq!(decode_b10(0xB4, None), "ROM1[enc=52]=OMNIVERSE");
+    }
+
+    #[test]
+    fn decode_b10_undefined_range_shows_hex() {
+        // 0x3C–0x7E are not defined (between RAM and ROM)
+        assert_eq!(decode_b10(0x3C, None), "b10=0x3C(?)");
     }
 }

@@ -24,6 +24,8 @@ the Sojus Records SD-1 VST3 plugin. See [HFE format and pre-0.9.8 disk write bug
   - [create](#create)
   - [hfe-to-img](#hfe-to-img)
   - [img-to-hfe](#img-to-hfe)
+  - [inspect-sysex](#inspect-sysex)
+  - [dump-programs](#dump-programs)
 - [HFE format and pre-0.9.8 disk write bug](#hfe-format-and-pre-0.9.8-disk-write-bug)
 - [SD-1 disk format overview](#sd-1-disk-format-overview)
 - [Supported file types](#supported-file-types)
@@ -77,6 +79,12 @@ sd1cli img-to-hfe my_sounds.img my_sounds.hfe
 
 # Convert an HFE back to a flat .img
 sd1cli hfe-to-img my_sounds.hfe my_sounds.img
+
+# Inspect the contents of a SysEx file
+sd1cli inspect-sysex dump.syx
+
+# Show the 60 programs embedded in a SixtySequences file
+sd1cli dump-programs my_sequences.img --file COUNTRY
 ```
 
 ---
@@ -263,6 +271,61 @@ VST3 plugin. Uses atomic write (writes to `.hfe.tmp` then renames).
 
 ```sh
 sd1cli img-to-hfe my_sounds.img my_sounds.hfe
+```
+
+---
+
+### inspect-sysex
+
+```
+sd1cli inspect-sysex <SYSEX>
+```
+
+Parses a SysEx `.syx` file and displays its contents without touching any disk image.
+
+| Message type | Output |
+|---|---|
+| `AllPrograms` | Lists all 60 program slot names |
+| `OneProgram` | Shows program name and payload size |
+| `AllPresets` | Shows preset count and size |
+| `AllSequences` / `SingleSequence` | Shows message type and payload size |
+| Other | Shows message type byte and payload size |
+
+**Example:**
+
+```sh
+sd1cli inspect-sysex my_sequences.syx
+```
+
+---
+
+### dump-programs
+
+```
+sd1cli dump-programs <IMAGE> [--file <PREFIX>] [--sysex <SYSEX>]
+```
+
+Shows all 60 programs embedded in a `SixtySequences+Programs` disk file, and
+decodes the track-program assignments for the first three defined sequences.
+Program names are resolved: RAM slot indices are shown with their actual program
+name from the file, and ROM references are decoded to bank and patch name.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--file PREFIX` | First SixtySequences+Programs file found | File name prefix to search for |
+| `--sysex PATH` | (none) | AllPrograms SysEx file to compare slot-by-slot against the disk |
+
+**Examples:**
+
+```sh
+# Dump programs from the first SixtySequences+Programs file on a disk
+sd1cli dump-programs my_sequences.img
+
+# Target a specific file by name prefix
+sd1cli dump-programs my_sequences.img --file COUNTRY
+
+# Compare on-disk programs against a SysEx AllPrograms dump
+sd1cli dump-programs my_sequences.img --file COUNTRY --sysex my_programs.syx
 ```
 
 ---
