@@ -4,7 +4,7 @@ use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
     disk_to_allsequences, block1_entries, block1_find, read_hfe, write_hfe,
-    next_file_number, file_type_info,
+    next_file_number, file_type_info, program_name_from_slot, decode_b10,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,28 @@ Uses atomic write (writes to .hfe.tmp then renames).")]
         /// Path for the output HFE file
         hfe: PathBuf,
     },
+    /// Show programs embedded in a SixtySequences file
+    #[command(name = "dump-programs", long_about = "\
+Show all 60 programs embedded in a SixtySequences+Programs disk file.
+
+Finds the named file on the disk image, de-interleaves its programs section,
+and prints all 60 program slot names. Also decodes the track-program assignments
+for the first three defined sequences, resolving RAM slot indices to program names
+and ROM bank references.
+
+Use --file to specify the file name prefix to search for (default: first
+SixtySequences+Programs file found). Use --sysex to compare the on-disk programs
+against an AllPrograms SysEx file slot-by-slot.")]
+    DumpPrograms {
+        /// Path to the SD-1 disk image file
+        image: PathBuf,
+        /// File name prefix to search for (default: first SixtySequences+Programs file)
+        #[arg(long, help = "File name prefix to search for")]
+        file: Option<String>,
+        /// Optional AllPrograms SysEx file to compare against
+        #[arg(long, help = "AllPrograms SysEx file for slot comparison")]
+        sysex: Option<PathBuf>,
+    },
     /// Parse and display contents of a SysEx file
     #[command(name = "inspect-sysex", long_about = "\
 Parse a SysEx (.syx) file and display its contents.
@@ -195,6 +217,8 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
         Command::HfeToImg { hfe, img } => cmd_hfe_to_img(&hfe, &img),
         Command::ImgToHfe { img, hfe } => cmd_img_to_hfe(&img, &hfe),
         Command::InspectSysex { sysex } => cmd_inspect_sysex(&sysex),
+        Command::DumpPrograms { image, file, sysex } =>
+            cmd_dump_programs(&image, file.as_deref(), sysex.as_deref()),
     }
 }
 
@@ -523,6 +547,144 @@ fn cmd_create(image_path: &Path) -> sd1disk::Result<()> {
     let img = DiskImage::create();
     img.save(image_path)?;
     println!("Created blank disk image: {}", image_path.display());
+    Ok(())
+}
+
+fn cmd_dump_programs(
+    image_path: &Path,
+    file_prefix: Option<&str>,
+    sysex_path: Option<&Path>,
+) -> sd1disk::Result<()> {
+    const PROGRAMS_OFFSET: usize = 11776;
+    const PROGRAMS_END: usize = 43576;
+    const PROGRAM_SIZE: usize = 530;
+    const SIXTY: usize = 60;
+    const HEADER_SIZE: usize = 188;
+    const TRACK_PARAMS_START: usize = 28;
+    const TRACK_PARAM_SIZE: usize = 11;
+    const TRACK_COUNT: usize = 12;
+    const TRACK_PROG_BYTE: usize = 10;
+
+    let img = DiskImage::open(image_path)?;
+
+    // Find the target entry: match prefix if given, else first SixtySequences+Programs file.
+    let (entry, raw) = {
+        let candidates: Vec<_> = all_entries(&img)
+            .into_iter()
+            .filter(|e| {
+                matches!(e.file_type, FileType::SixtySequences) && (e.type_info & 0x20 != 0)
+            })
+            .collect();
+
+        let entry = if let Some(prefix) = file_prefix {
+            let upper = prefix.to_uppercase();
+            candidates.into_iter()
+                .find(|e| e.name_str().to_uppercase().starts_with(&upper))
+                .ok_or_else(|| sd1disk::Error::FileNotFound(prefix.to_string()))?
+        } else {
+            candidates.into_iter().next()
+                .ok_or_else(|| sd1disk::Error::FileNotFound(
+                    "(no SixtySequences+Programs file found)".to_string()
+                ))?
+        };
+
+        let chain = FileAllocationTable::chain(&img, entry.first_block as u16)?;
+        let mut raw = Vec::new();
+        for &b in &chain {
+            raw.extend_from_slice(img.block(b)?);
+        }
+        raw.truncate(entry.size_bytes as usize);
+        (entry, raw)
+    };
+
+    if raw.len() < PROGRAMS_END {
+        return Err(sd1disk::Error::InvalidSysEx(
+            "file too short to contain embedded programs section",
+        ));
+    }
+
+    // De-interleave and decode program names.
+    let deint = deinterleave_sixty_programs(&raw[PROGRAMS_OFFSET..PROGRAMS_END])?;
+    let disk_names: Vec<String> = (0..SIXTY)
+        .map(|i| program_name_from_slot(&deint[i * PROGRAM_SIZE..(i + 1) * PROGRAM_SIZE]))
+        .collect();
+
+    println!("Programs in {} ({} bytes):", entry.name_str(), raw.len());
+    println!("{:<6} {}", "SLOT", "NAME");
+    println!("{}", "-".repeat(24));
+    for (i, name) in disk_names.iter().enumerate() {
+        println!("{:<6} {}", i, name);
+    }
+
+    // Optionally compare against SysEx AllPrograms.
+    if let Some(syx_path) = sysex_path {
+        use sd1disk::sysex::SysExPacket;
+        let syx_bytes = std::fs::read(syx_path)?;
+        let packets = SysExPacket::parse_all(&syx_bytes)?;
+        let ap = packets.iter()
+            .find(|p| matches!(p.message_type, MessageType::AllPrograms))
+            .ok_or_else(|| sd1disk::Error::InvalidSysEx("no AllPrograms packet in SysEx file"))?;
+
+        let expected = SIXTY * PROGRAM_SIZE;
+        if ap.payload.len() != expected {
+            return Err(sd1disk::Error::InvalidSysEx("AllPrograms payload wrong size"));
+        }
+        let syx_names: Vec<String> = (0..SIXTY)
+            .map(|i| program_name_from_slot(&ap.payload[i * PROGRAM_SIZE..(i + 1) * PROGRAM_SIZE]))
+            .collect();
+
+        println!();
+        println!("Comparison vs SysEx ({}):", syx_path.display());
+        println!("{:<6} {:<20} {:<20} {}", "SLOT", "DISK", "SYSEX", "MATCH");
+        println!("{}", "-".repeat(56));
+        let mut mismatches = 0usize;
+        for i in 0..SIXTY {
+            if disk_names[i] != syx_names[i] {
+                mismatches += 1;
+                println!("{:<6} {:<20} {:<20} MISMATCH", i, &disk_names[i], &syx_names[i]);
+            }
+        }
+        if mismatches == 0 {
+            println!("All 60 slots match.");
+        } else {
+            println!("{} mismatch(es) out of 60 slots.", mismatches);
+        }
+    }
+
+    // Decode track program assignments from the first 3 defined sequences.
+    println!();
+    println!("Track program assignments (first 3 defined sequences):");
+    let mut shown = 0usize;
+    for seq in 0..SIXTY {
+        let hdr_start = seq * HEADER_SIZE;
+        let hdr = &raw[hdr_start..hdr_start + HEADER_SIZE];
+        if hdr[0] == 0xFF {
+            continue; // undefined slot
+        }
+        let name_raw: Vec<u8> = hdr[2..13].iter().map(|&b| b & 0x7F).collect();
+        let name_end = name_raw.iter().rposition(|&b| b != 0 && b != b' ')
+            .map(|i| i + 1).unwrap_or(0);
+        let seq_name = String::from_utf8_lossy(&name_raw[..name_end]).into_owned();
+
+        println!("  Seq {:>2} ({}):", seq, seq_name);
+        for track in 0..TRACK_COUNT {
+            let tp_off = TRACK_PARAMS_START + track * TRACK_PARAM_SIZE;
+            let b10 = hdr[tp_off + TRACK_PROG_BYTE];
+            if b10 == 0xFF {
+                continue; // inactive track
+            }
+            let prog_str = decode_b10(b10, Some(&disk_names));
+            println!("    Track {:>2}: {}", track + 1, prog_str);
+        }
+        shown += 1;
+        if shown >= 3 {
+            break;
+        }
+    }
+    if shown == 0 {
+        println!("  (no defined sequences found)");
+    }
+
     Ok(())
 }
 
