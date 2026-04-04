@@ -14,6 +14,8 @@ the Sojus Records SD-1 VST3 plugin. See [HFE format and pre-0.9.8 disk write bug
 ## Contents
 
 - [Installation](#installation)
+  - [Pre-built binaries](#pre-built-binaries)
+  - [Building from source](#building-from-source)
 - [Quick start](#quick-start)
 - [Commands](#commands)
   - [list](#list)
@@ -35,10 +37,49 @@ the Sojus Records SD-1 VST3 plugin. See [HFE format and pre-0.9.8 disk write bug
 
 ## Installation
 
+### Pre-built binaries
+
+Download the latest release from the [Releases page](https://github.com/joemcmahon/sd1diskutil/releases).
+Four archives are provided:
+
+| File | Platform |
+|------|----------|
+| `sd1cli-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon (M1/M2/M3/M4) |
+| `sd1cli-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `sd1cli-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static, no glibc dependency) |
+| `sd1cli-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+Extract the archive and copy the binary to a location on your `PATH`.
+
+#### macOS: removing the quarantine attribute
+
+macOS Gatekeeper marks downloaded binaries as quarantined. Because `sd1cli` is
+not notarized, macOS will refuse to run it until the quarantine attribute is
+removed:
+
+```sh
+xattr -d com.apple.quarantine sd1cli
+```
+
+Then copy to your PATH as normal:
+
+```sh
+cp sd1cli /usr/local/bin/
+```
+
+#### Linux
+
+```sh
+tar xzf sd1cli-x86_64-unknown-linux-musl.tar.gz
+cp sd1cli /usr/local/bin/
+```
+
+### Building from source
+
 Requires [Rust](https://rustup.rs/) 1.75 or later.
 
 ```sh
-git clone https://github.com/yourname/sd1diskutil
+git clone https://github.com/joemcmahon/sd1diskutil
 cd sd1diskutil
 cargo build --release
 ```
