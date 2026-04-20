@@ -9,9 +9,14 @@
 #include <stdlib.h>
 /* Opaque handles — never dereference these directly in C/C++ code. */
 typedef struct DiskImage    DiskImage;
+typedef struct DiskImage    Sd1DiskImage;
+typedef struct SysExPacket  SysExPacket;
 typedef struct SysExPacket  Sd1SysExPacket;
+typedef struct Program      Program;
 typedef struct Program      Sd1Program;
+typedef struct Preset       Preset;
 typedef struct Preset       Sd1Preset;
+typedef struct Sequence     Sequence;
 typedef struct Sequence     Sd1Sequence;
 
 
