@@ -36,7 +36,7 @@ impl MessageType {
         }
     }
 
-    fn to_byte(&self) -> u8 {
+    pub fn to_byte(&self) -> u8 {
         match self {
             MessageType::Command         => 0x00,
             MessageType::Error           => 0x01,
