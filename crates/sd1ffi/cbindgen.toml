@@ -17,6 +17,21 @@ typedef struct Preset       Preset;
 typedef struct Preset       Sd1Preset;
 typedef struct Sequence     Sequence;
 typedef struct Sequence     Sd1Sequence;
+
+/* File type byte values for sd1_disk_write / sd1_disk_find / Sd1DirectoryEntry.file_type */
+#define SD1_FILE_ONE_PROGRAM       ((uint8_t)0x0A)
+#define SD1_FILE_SIX_PROGRAMS      ((uint8_t)0x0B)
+#define SD1_FILE_THIRTY_PROGRAMS   ((uint8_t)0x0C)
+#define SD1_FILE_SIXTY_PROGRAMS    ((uint8_t)0x0D)
+#define SD1_FILE_ONE_PRESET        ((uint8_t)0x0E)
+#define SD1_FILE_TEN_PRESETS       ((uint8_t)0x0F)
+#define SD1_FILE_TWENTY_PRESETS    ((uint8_t)0x10)
+#define SD1_FILE_ONE_SEQUENCE      ((uint8_t)0x11)
+#define SD1_FILE_THIRTY_SEQUENCES  ((uint8_t)0x12)
+#define SD1_FILE_SIXTY_SEQUENCES   ((uint8_t)0x13)
+#define SD1_FILE_SYSTEM_EXCLUSIVE  ((uint8_t)0x14)
+#define SD1_FILE_SYSTEM_SETUP      ((uint8_t)0x15)
+#define SD1_FILE_SEQUENCER_OS      ((uint8_t)0x16)
 """
 
 [export]
