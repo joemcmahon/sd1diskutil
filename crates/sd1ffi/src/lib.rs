@@ -1678,4 +1678,26 @@ mod tests {
         let nul = out.iter().position(|&b| b == 0).unwrap_or(out.len());
         assert!(nul > 0 || out[0] == 0); // at minimum, doesn't crash
     }
+
+    #[test]
+    fn int0_programs_function_returns_populated_table() {
+        let ptr = sd1_int0_programs();
+        assert!(!ptr.is_null());
+        let first = unsafe { CStr::from_ptr(*ptr) };
+        assert_eq!(first.to_str().unwrap(), "ARTIC-ELATE");
+        let last = unsafe { CStr::from_ptr(*ptr.add(59)) };
+        assert_eq!(last.to_str().unwrap(), "MEAN-KIT-1");
+    }
+
+    #[test]
+    fn rom_all_programs_function_returns_populated_table() {
+        let ptr = sd1_rom_all_programs();
+        assert!(!ptr.is_null());
+        let first = unsafe { CStr::from_ptr(*ptr) };
+        assert_eq!(first.to_str().unwrap(), "ITS-A-SYNTH");
+        let rom1_first = unsafe { CStr::from_ptr(*ptr.add(60)) };
+        assert_eq!(rom1_first.to_str().unwrap(), "OMNIVERSE");
+        let last = unsafe { CStr::from_ptr(*ptr.add(119)) };
+        assert_eq!(last.to_str().unwrap(), " INDO-AFRO");
+    }
 }
