@@ -416,6 +416,31 @@ int32_t sd1_disk_to_allsequences(const uint8_t *disk,
                                  uintptr_t *out_len);
 
 /**
+ * Convert on-disk ThirtySequences data to an AllSequences SysEx payload (60-slot format).
+ * Slots 0–29 are populated from disk; slots 30–59 are set to undefined (0xFF headers).
+ * Programs embedded after sequence data (if any) are not included in the output.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_disk_to_thirty_sequences(const uint8_t *disk,
+                                     uintptr_t len,
+                                     uint8_t **out,
+                                     uintptr_t *out_len);
+
+/**
+ * Convert an AllSequences SysEx payload to on-disk ThirtySequences format.
+ * Only slots 0–29 are written; slots 30–59 are ignored.
+ * Programs (if any) are placed AFTER sequence data (opposite of SixtySequences layout).
+ * If interleaved_progs is NULL, programs are not embedded.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_thirty_sequences_to_disk(const uint8_t *payload,
+                                     uintptr_t payload_len,
+                                     const uint8_t *interleaved_progs,
+                                     uintptr_t progs_len,
+                                     uint8_t **out,
+                                     uintptr_t *out_len);
+
+/**
  * Interleave 60 programs from AllPrograms SysEx payload order to on-disk SixtyPrograms format.
  * Caller must call sd1_bytes_free(*out, *out_len).
  */

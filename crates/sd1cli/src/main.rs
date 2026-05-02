@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
-    disk_to_allsequences, block1_entries, block1_find, read_hfe, write_hfe,
+    disk_to_allsequences, disk_to_thirty_sequences, block1_entries, block1_find, read_hfe, write_hfe,
     next_file_number, file_type_info, program_name_from_slot, decode_b10,
 };
 use sd1disk::sysex::SysExPacket;
@@ -475,7 +475,11 @@ fn cmd_extract(
             raw.extend_from_slice(img.block(b)?);
         }
     }
-    raw.truncate(entry.size_bytes as usize);
+    // ThirtySequences and SixtySequences store logical size in size_bytes, not disk size.
+    // The decoders need full block-aligned data, so only truncate for other file types.
+    if !matches!(entry.file_type, FileType::ThirtySequences | FileType::SixtySequences) {
+        raw.truncate(entry.size_bytes as usize);
+    }
 
     let sysex_bytes = match entry.file_type {
         FileType::OneProgram => {
@@ -489,8 +493,17 @@ fn cmd_extract(
             SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, model: 0, payload }
                 .to_bytes(channel)
         }
-        FileType::OneSequence | FileType::ThirtySequences => {
+        FileType::OneSequence => {
             Sequence::from_bytes(&raw).to_sysex(channel).to_bytes(channel)
+        }
+        FileType::ThirtySequences => {
+            let payload = disk_to_thirty_sequences(&raw)?;
+            sd1disk::sysex::SysExPacket {
+                message_type: sd1disk::MessageType::AllSequences,
+                midi_channel: channel,
+                model: 0,
+                payload,
+            }.to_bytes(channel)
         }
         FileType::SixtySequences => {
             let has_programs = entry.type_info & 0x20 != 0;

@@ -360,6 +360,189 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
     Ok(payload)
 }
 
+/// Reverse of `thirty_sequences_to_disk`: reconstruct an AllSequences SysEx payload
+/// from the SD-1 on-disk ThirtySequences format.
+///
+/// On-disk layout:
+///   [0..5640]    – 30 × 188-byte sequence headers
+///   [5640..5661] – 21-byte global section
+///   [5661..6144] – zeros (483 bytes)
+///   [6144..]     – sequence event data (each sequence block-padded to 512 bytes)
+///                  Programs (if any) appear after the sequence data and are ignored here.
+///
+/// Reconstructed SysEx AllSequences payload (60-slot format):
+///   [0..240]                  – 240 zero bytes (ptr table; SD-1 rebuilds)
+///   [240..252]                – 12 zero bytes (SD-1-internal event header)
+///   [252..252+N]              – packed sequence event data
+///   [252+N..252+N+5640]       – 30 × 188-byte sequence headers (slots 0–29)
+///   [252+N+5640..252+N+11280] – 30 × 188 undefined headers (slots 30–59, all 0xFF)
+///   [252+N+11280..]           – 21-byte global section
+pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
+    const HEADER_SIZE: usize = 188;
+    const HEADER_COUNT: usize = 30;
+    const HEADER_COUNT_SIXTY: usize = 60;
+    const HEADERS_TOTAL: usize = HEADER_SIZE * HEADER_COUNT;         // 5640
+    const GLOBAL_SIZE: usize = 21;
+    const GLOBAL_DISK_START: usize = HEADERS_TOTAL;                  // 5640
+    const GLOBAL_DISK_END: usize = GLOBAL_DISK_START + GLOBAL_SIZE;  // 5661
+    const SEQ_DATA_OFFSET: usize = 6144;
+    const BLOCK_SIZE: usize = 512;
+    const PTR_TABLE_SIZE: usize = 240;
+    const EVENT_LEAD_ZEROS: usize = 12;
+
+    if disk.len() < SEQ_DATA_OFFSET {
+        return Err(Error::InvalidSysEx("on-disk ThirtySequences data too short"));
+    }
+
+    let headers_sec = &disk[..HEADERS_TOTAL];
+    let global_sec  = &disk[GLOBAL_DISK_START..GLOBAL_DISK_END];
+
+    let mut packed_events: Vec<u8> = Vec::new();
+    let mut in_pos = SEQ_DATA_OFFSET;
+    for slot in 0..HEADER_COUNT {
+        let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        if ds == 0 { continue; }
+        if in_pos + ds > disk.len() {
+            return Err(Error::InvalidSysEx("on-disk ThirtySequences: sequence data out of bounds"));
+        }
+        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds]);
+        in_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+    }
+
+    // Reconstruct 60-slot AllSequences payload: slots 0–29 from disk, 30–59 undefined.
+    let undefined_hdr = [0xFFu8; HEADER_SIZE];
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; PTR_TABLE_SIZE]);
+    payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
+    payload.extend_from_slice(&packed_events);
+    payload.extend_from_slice(headers_sec);
+    for _ in HEADER_COUNT..HEADER_COUNT_SIXTY {
+        payload.extend_from_slice(&undefined_hdr);
+    }
+    payload.extend_from_slice(global_sec);
+
+    Ok(payload)
+}
+
+/// Convert an AllSequences SysEx payload to the SD-1 on-disk ThirtySequences format.
+///
+/// Only sequence slots 0–29 are written; slots 30–59 in the payload are ignored.
+/// Programs (if provided) are embedded AFTER the sequence data, unlike SixtySequences
+/// which places programs before sequence data.
+///
+/// On-disk ThirtySequences (no programs) layout:
+/// ```text
+/// 00000–05639  Sequence headers (30 × 188)
+/// 05640–05660  Global section (21 bytes)
+/// 05661–06143  Zeros (483 bytes)
+/// 06144–…      Sequence data (block-padded to 512 bytes per sequence)
+/// ```
+///
+/// On-disk ThirtySequences (with programs) layout:
+/// ```text
+/// 00000–05639  Sequence headers (30 × 188)
+/// 05640–05660  Global section (21 bytes)
+/// 05661–06143  Zeros (483 bytes)
+/// 06144–…      Sequence data (block-padded)
+/// …            60 Programs interleaved (31800 bytes)
+/// …            Zeros (456 bytes)
+/// ```
+pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>) -> Result<Vec<u8>> {
+    const PTR_TABLE_SIZE: usize = 240;
+    const HEADER_SIZE: usize = 188;
+    const HEADER_COUNT: usize = 30;
+    const HEADER_COUNT_SIXTY: usize = 60;
+    const GLOBAL_SIZE: usize = 21;
+    const HEADERS_TOTAL_THIRTY: usize = HEADER_SIZE * HEADER_COUNT;          // 5640
+    const HEADERS_TOTAL_SIXTY: usize  = HEADER_SIZE * HEADER_COUNT_SIXTY;    // 11280
+    const EVENT_LEAD_ZEROS: usize = 12;
+    const SEQ_DATA_OFFSET: usize = 6144;
+    const BLOCK_SIZE: usize = 512;
+    const PROGRAMS_SIZE: usize = 60 * 530;  // 31800 (always 60 programs even in ThirtySeq)
+    const PROGRAMS_PADDING: usize = 456;
+
+    if let Some(progs) = interleaved_programs {
+        if progs.len() != PROGRAMS_SIZE {
+            return Err(Error::InvalidSysEx(
+                "interleaved programs must be exactly 60 × 530 bytes",
+            ));
+        }
+    }
+
+    let min_thirty = PTR_TABLE_SIZE + HEADERS_TOTAL_THIRTY + GLOBAL_SIZE;
+    let min_sixty  = PTR_TABLE_SIZE + HEADERS_TOTAL_SIXTY  + GLOBAL_SIZE;
+    if payload.len() < min_thirty {
+        return Err(Error::InvalidSysEx("AllSequences payload too short"));
+    }
+
+    // Locate headers and global (same layout as allsequences_to_disk).
+    let total_header_bytes = if payload.len() >= min_sixty { HEADERS_TOTAL_SIXTY } else { HEADERS_TOTAL_THIRTY };
+    let global_sec    = &payload[payload.len() - GLOBAL_SIZE..];
+    let headers_start = payload.len() - GLOBAL_SIZE - total_header_bytes;
+    let headers_sec   = &payload[headers_start..payload.len() - GLOBAL_SIZE];
+    let event_data    = &payload[PTR_TABLE_SIZE..headers_start];
+
+    if event_data.len() < EVENT_LEAD_ZEROS {
+        return Err(Error::InvalidSysEx("AllSequences payload: event data section too short"));
+    }
+    let event_content = &event_data[EVENT_LEAD_ZEROS..];
+
+    // Compute total event bytes from slot ds values (robust even if global is zeroed).
+    let total_ds: usize = (0..HEADER_COUNT)
+        .filter_map(|slot| {
+            let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+            if hdr[0] == 0xFF { return None; }
+            let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+            if ds == 0 { None } else { Some(ds) }
+        })
+        .sum();
+
+    if event_content.len() < total_ds {
+        return Err(Error::InvalidSysEx("AllSequences payload: event data too short for declared sequence sizes"));
+    }
+
+    // Compute on-disk padded size for slots 0–29 only.
+    let padded_total: usize = (0..HEADER_COUNT)
+        .filter_map(|slot| {
+            let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+            if hdr[0] == 0xFF { return None; }
+            let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+            if ds == 0 { return None; }
+            Some((ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE)
+        })
+        .sum();
+
+    let prog_section = if interleaved_programs.is_some() { PROGRAMS_SIZE + PROGRAMS_PADDING } else { 0 };
+    let file_size = SEQ_DATA_OFFSET + padded_total + prog_section;
+    let mut out = vec![0u8; file_size];
+
+    // Write first 30 headers and global.
+    out[..HEADERS_TOTAL_THIRTY].copy_from_slice(&headers_sec[..HEADERS_TOTAL_THIRTY]);
+    out[HEADERS_TOTAL_THIRTY..HEADERS_TOTAL_THIRTY + GLOBAL_SIZE].copy_from_slice(global_sec);
+
+    // Write sequence data at SEQ_DATA_OFFSET.
+    let mut in_pos  = 0usize;
+    let mut out_pos = SEQ_DATA_OFFSET;
+    for slot in 0..HEADER_COUNT {
+        let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        if ds == 0 { continue; }
+        out[out_pos..out_pos + ds].copy_from_slice(&event_content[in_pos..in_pos + ds]);
+        in_pos  += ds;
+        out_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+    }
+
+    // Write programs AFTER sequence data (ThirtySeq layout).
+    if let Some(progs) = interleaved_programs {
+        out[out_pos..out_pos + PROGRAMS_SIZE].copy_from_slice(progs);
+    }
+
+    Ok(out)
+}
+
 /// INT0 user bank: 10 banks × 6 patches, indexed by b10 value (0–59).
 pub const INT0_PROGRAMS: [&str; 60] = [
     // bank 0
@@ -685,6 +868,146 @@ mod tests {
     fn disk_to_allsequences_rejects_short_disk() {
         let result = disk_to_allsequences(&[0u8; 100], false);
         assert!(result.is_err());
+    }
+
+    // ── ThirtySequences round-trip ────────────────────────────────────────────
+
+    fn make_thirty_seq_payload(ds: usize) -> Vec<u8> {
+        // Build a minimal AllSequences payload with one defined sequence (slot 0, ds bytes).
+        const HEADER_COUNT: usize = 60;
+        const HEADER_SIZE: usize = 188;
+        const GLOBAL_SIZE: usize = 21;
+        let size_sum: u32 = ds as u32 + 0xFC;
+        let mut headers = vec![0u8; HEADER_COUNT * HEADER_SIZE];
+        headers[0] = 0x00;   // slot 0 defined
+        headers[183] = (ds >> 16) as u8;
+        headers[184] = (ds >> 8) as u8;
+        headers[185] = ds as u8;
+        // slots 1-29: byte 0 = 0 (defined, ds=0 → no data); slots 30-59: 0xFF
+        for s in 30..HEADER_COUNT {
+            headers[s * HEADER_SIZE] = 0xFF;
+        }
+        let seq_bytes: Vec<u8> = (0..ds as u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 240]);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(&seq_bytes);
+        payload.extend_from_slice(&headers);
+        let mut global = [0u8; GLOBAL_SIZE];
+        global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+        payload.extend_from_slice(&global);
+        payload
+    }
+
+    #[test]
+    fn thirty_sequences_to_disk_layout() {
+        const DS: usize = 170;
+        let payload = make_thirty_seq_payload(DS);
+        let disk = thirty_sequences_to_disk(&payload, None).unwrap();
+
+        // File size = 6144 + 512 (DS padded to one 512-byte block)
+        assert_eq!(disk.len(), 6144 + 512);
+        // First 30 headers at [0..5640]
+        let expected_headers = &payload[payload.len() - 21 - 60 * 188..payload.len() - 21 - 30 * 188];
+        assert_eq!(&disk[..30 * 188], expected_headers);
+        // Global at [5640..5661]
+        let global_in_payload = &payload[payload.len() - 21..];
+        assert_eq!(&disk[5640..5661], global_in_payload);
+        // Padding at [5661..6144] all zeros
+        assert!(disk[5661..6144].iter().all(|&b| b == 0));
+        // Sequence data at [6144..6144+DS]
+        let seq_bytes: Vec<u8> = (0..DS as u8).collect();
+        assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
+    }
+
+    #[test]
+    fn thirty_sequences_round_trips_via_disk() {
+        const DS: usize = 170;
+        let payload = make_thirty_seq_payload(DS);
+        let disk = thirty_sequences_to_disk(&payload, None).unwrap();
+        let recovered = disk_to_thirty_sequences(&disk).unwrap();
+        let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
+        assert_eq!(disk, disk2, "ThirtySeq disk→payload→disk round-trip must be lossless");
+
+        // Event data at [252..252+DS] in recovered payload
+        let event_start = 240 + 12;
+        let seq_bytes: Vec<u8> = (0..DS as u8).collect();
+        assert_eq!(&recovered[event_start..event_start + DS], seq_bytes.as_slice());
+    }
+
+    #[test]
+    fn thirty_sequences_round_trips_with_zeroed_global() {
+        // Verify that thirty_sequences_to_disk works even when the global is all zeros
+        // (as seen in real ROCK-BEATS disk files where the hardware left global zeroed).
+        const DS: usize = 200;
+        const HEADER_COUNT: usize = 60;
+        const HEADER_SIZE: usize = 188;
+        let mut headers = vec![0u8; HEADER_COUNT * HEADER_SIZE];
+        headers[0] = 0x00;
+        headers[183] = 0; headers[184] = 0; headers[185] = DS as u8;
+        for s in 30..HEADER_COUNT { headers[s * HEADER_SIZE] = 0xFF; }
+
+        let seq_bytes: Vec<u8> = (0..DS as u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 240]);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(&seq_bytes);
+        payload.extend_from_slice(&headers);
+        payload.extend_from_slice(&[0u8; 21]); // global all zeros
+
+        let disk = thirty_sequences_to_disk(&payload, None).unwrap();
+        assert_eq!(disk.len(), 6144 + 512);
+        assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
+
+        let recovered = disk_to_thirty_sequences(&disk).unwrap();
+        let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
+        assert_eq!(disk, disk2);
+    }
+
+    #[test]
+    fn disk_to_thirty_sequences_rejects_short_disk() {
+        let result = disk_to_thirty_sequences(&[0u8; 100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn thirty_sequences_to_disk_rejects_short_payload() {
+        let result = thirty_sequences_to_disk(&[0u8; 100], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn thirty_sequences_slots_30_to_59_ignored_on_write() {
+        // Slots 30-59 defined in the payload should NOT appear in the ThirtySeq output.
+        const DS: usize = 100;
+        const HEADER_COUNT: usize = 60;
+        const HEADER_SIZE: usize = 188;
+        let size_sum: u32 = (DS * 2) as u32 + 0xFC; // two sequences
+        let mut headers = vec![0u8; HEADER_COUNT * HEADER_SIZE];
+        // slot 0: defined, ds=DS
+        headers[0] = 0x00;
+        headers[183] = 0; headers[184] = 0; headers[185] = DS as u8;
+        // slot 30: also defined, ds=DS (should be ignored in ThirtySeq output)
+        let off30 = 30 * HEADER_SIZE;
+        headers[off30] = 0x1E;
+        headers[off30 + 183] = 0; headers[off30 + 184] = 0; headers[off30 + 185] = DS as u8;
+
+        let seq_bytes: Vec<u8> = (0..(DS * 2) as u8).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 240]);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(&seq_bytes);
+        payload.extend_from_slice(&headers);
+        let mut global = [0u8; 21];
+        global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+        payload.extend_from_slice(&global);
+
+        let disk = thirty_sequences_to_disk(&payload, None).unwrap();
+        // Only slot 0's data (DS bytes, padded to 512) should appear after offset 6144.
+        // If slot 30 were also written, file would be 6144 + 1024 bytes.
+        assert_eq!(disk.len(), 6144 + 512, "slot 30 must not be written to ThirtySeq output");
+        let first_ds_bytes: Vec<u8> = (0..DS as u8).collect();
+        assert_eq!(&disk[6144..6144 + DS], first_ds_bytes.as_slice());
     }
 
     #[test]
