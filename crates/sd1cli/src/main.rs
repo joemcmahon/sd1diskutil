@@ -488,6 +488,14 @@ fn cmd_extract(
         FileType::OnePreset => {
             Preset::from_bytes(&raw)?.to_sysex(channel).to_bytes(channel)
         }
+        FileType::TwentyPresets => {
+            sd1disk::sysex::SysExPacket {
+                message_type: sd1disk::MessageType::AllPresets,
+                midi_channel: channel,
+                model: 0,
+                payload: raw.clone(),
+            }.to_bytes(channel)
+        }
         FileType::SixtyPrograms => {
             let payload = deinterleave_sixty_programs(&raw)?;
             SysExPacket { message_type: MessageType::AllPrograms, midi_channel: channel, model: 0, payload }

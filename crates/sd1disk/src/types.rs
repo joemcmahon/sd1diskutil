@@ -411,6 +411,20 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
         in_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
     }
 
+    // If the on-disk global has a zeroed size_sum (real hardware quirk: ROCK-BEATS),
+    // synthesize a correct value so allsequences_to_disk can parse the produced payload.
+    // size_sum = total_event_bytes + 0xFC (SD-1 encoding convention).
+    let mut global_out = [0u8; GLOBAL_SIZE];
+    global_out.copy_from_slice(global_sec);
+    let stored_size_sum = u32::from_be_bytes([
+        global_out[2], global_out[3], global_out[4], global_out[5],
+    ]);
+    if stored_size_sum == 0 && !packed_events.is_empty() {
+        let size_sum = (packed_events.len() as u32).saturating_add(0xFC);
+        let bytes = size_sum.to_be_bytes();
+        global_out[2..6].copy_from_slice(&bytes);
+    }
+
     // Reconstruct 60-slot AllSequences payload: slots 0–29 from disk, 30–59 undefined.
     let undefined_hdr = [0xFFu8; HEADER_SIZE];
     let mut payload = Vec::new();
@@ -421,7 +435,7 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     for _ in HEADER_COUNT..HEADER_COUNT_SIXTY {
         payload.extend_from_slice(&undefined_hdr);
     }
-    payload.extend_from_slice(global_sec);
+    payload.extend_from_slice(&global_out);
 
     Ok(payload)
 }
@@ -959,9 +973,19 @@ mod tests {
         assert_eq!(disk.len(), 6144 + 512);
         assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
 
+        // disk_to_thirty_sequences synthesizes a corrected global (size_sum) when the
+        // on-disk global is zeroed, so disk2 global bytes differ from disk. Assert
+        // that event data and headers survive, and that the second round-trip is stable.
         let recovered = disk_to_thirty_sequences(&disk).unwrap();
         let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
-        assert_eq!(disk, disk2);
+        assert_eq!(disk2.len(), 6144 + 512);
+        // Event data preserved.
+        assert_eq!(&disk2[6144..6144 + DS], seq_bytes.as_slice());
+        // Headers (slots 0-29) preserved.
+        assert_eq!(&disk2[..30 * 188], &disk[..30 * 188]);
+        // Second round-trip is stable (global already corrected).
+        let disk3 = thirty_sequences_to_disk(&disk_to_thirty_sequences(&disk2).unwrap(), None).unwrap();
+        assert_eq!(disk2, disk3);
     }
 
     #[test]
