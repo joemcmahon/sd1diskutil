@@ -428,6 +428,23 @@ int sd1_disk_to_allsequences(const uint8_t* disk, size_t len, bool has_programs,
 Reverse of the above. Set `has_programs = true` if the on-disk data includes embedded programs.
 
 ```c
+int sd1_disk_to_thirty_sequences(const uint8_t* disk, size_t len,
+                                  uint8_t** out, size_t* out_len);
+```
+Convert on-disk ThirtySequences (file type `0x12`) data to a 60-slot AllSequences SysEx payload. Slots 0–29 are populated from the disk; slots 30–59 are set to undefined (`0xFF` headers). Any programs embedded after the sequence data are not included in the output. Unlike SixtySequences, ThirtySequences always stores sequence data at a fixed offset (6144 bytes), so no `has_programs` flag is needed.
+
+If the on-disk global section has an all-zeros `size_sum` (a known quirk of some real hardware files), the correct value is synthesized from the sequence header data so the resulting payload is always valid.
+
+```c
+int sd1_thirty_sequences_to_disk(const uint8_t* payload, size_t payload_len,
+                                  const uint8_t* interleaved_progs, size_t progs_len,
+                                  uint8_t** out, size_t* out_len);
+```
+Convert an AllSequences SysEx payload to on-disk ThirtySequences format. Only slots 0–29 are written; slots 30–59 are ignored. Pass `interleaved_progs = NULL, progs_len = 0` for the no-programs layout; pass exactly 31,800 bytes (`60 × 530`) of interleaved program data to embed programs after the sequence data.
+
+> **Layout note:** ThirtySequences differs from SixtySequences in two ways: sequence data always starts at offset 6144 (independent of whether programs are present), and when programs are embedded they appear *after* the sequence data rather than before it.
+
+```c
 int sd1_interleave_sixty_programs(const uint8_t* payload, size_t len,
                                    uint8_t** out, size_t* out_len);
 int sd1_deinterleave_sixty_programs(const uint8_t* data, size_t len,
