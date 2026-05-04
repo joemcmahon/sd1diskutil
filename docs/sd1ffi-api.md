@@ -190,6 +190,8 @@ int sd1_disk_extract(const Sd1DiskImage* img, const char* name,
 ```
 Extract the raw file data for `name`. Allocates a buffer; caller frees with `sd1_bytes_free(*data_out, *len_out)`.
 
+> **Note for sequence files:** For `SD1_FILE_THIRTY_SEQUENCES` and `SD1_FILE_SIXTY_SEQUENCES`, the returned buffer length is the full block-aligned size of the FAT chain, which may be larger than `Sd1DirectoryEntry.size_bytes`. Hardware-written files store `size_bytes` as the unpadded logical size, but sequence event data is block-padded on disk and the decoder functions (`sd1_disk_to_thirty_sequences`, `sd1_disk_to_allsequences`) require the full block-aligned data. Pass the entire returned buffer directly to those functions.
+
 ### Writing files
 
 ```c

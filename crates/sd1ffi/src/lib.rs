@@ -283,7 +283,11 @@ pub extern "C" fn sd1_disk_extract(
             }
         }
     }
-    raw.truncate(entry.size_bytes as usize);
+    // ThirtySequences and SixtySequences store logical size in size_bytes but sequence event
+    // data is block-padded on disk; the decoders need the full block-aligned data.
+    if !matches!(entry.file_type, FileType::ThirtySequences | FileType::SixtySequences) {
+        raw.truncate(entry.size_bytes as usize);
+    }
 
     let len = raw.len();
     let mut boxed = raw.into_boxed_slice();
@@ -1522,6 +1526,102 @@ mod tests {
         assert_eq!(extracted, data.as_slice());
         sd1_bytes_free(out_ptr, out_len);
         sd1_disk_free(img);
+    }
+
+    // Regression test: sd1_disk_extract must return full block-padded data for
+    // ThirtySequences/SixtySequences so that the decoder can access event data
+    // at block-aligned offsets past size_bytes (as hardware-written files have
+    // size_bytes = unpadded logical size, not the padded disk size).
+    #[test]
+    fn disk_extract_thirty_sequences_returns_block_aligned_data() {
+        use sd1disk::{thirty_sequences_to_disk, disk_to_thirty_sequences};
+
+        // Build an AllSequences payload with 2 sequences of 300 bytes each.
+        // thirty_sequences_to_disk will block-pad each to 512 bytes on disk,
+        // so total disk size = 6144 + 2*512 = 7168 bytes.
+        // We then store size_bytes = 6144 + 300 + 300 = 6744 (logical, unpadded),
+        // mimicking hardware behaviour.  With truncation, slot 1 event data
+        // starts at in_pos=6656 and ds=300 → end=6956 > 6744 → decode fails.
+        // Without truncation (the fix), end=6956 ≤ 7168 → decode succeeds.
+        const DS: usize = 300;
+        const HEADER_SIZE: usize = 188;
+        const HEADER_COUNT_SIXTY: usize = 60;
+        const PTR_TABLE: usize = 240;
+        const EVENT_LEAD: usize = 12;
+        const GLOBAL_SIZE: usize = 21;
+
+        // Build two 188-byte sequence headers with ds=300 in bytes 183-185.
+        let mut hdr0 = [0u8; HEADER_SIZE];
+        hdr0[183] = 0; hdr0[184] = ((DS >> 8) & 0xFF) as u8; hdr0[185] = (DS & 0xFF) as u8;
+        let mut hdr1 = [0u8; HEADER_SIZE];
+        hdr1[183] = 0; hdr1[184] = ((DS >> 8) & 0xFF) as u8; hdr1[185] = (DS & 0xFF) as u8;
+        let undef_hdr = [0xFFu8; HEADER_SIZE];
+
+        let event_data: Vec<u8> = (0u8..100).cycle().take(DS * 2).collect();
+        let global = [0u8; GLOBAL_SIZE];
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; PTR_TABLE]);
+        payload.extend_from_slice(&[0u8; EVENT_LEAD]);
+        payload.extend_from_slice(&event_data);
+        payload.extend_from_slice(&hdr0);
+        payload.extend_from_slice(&hdr1);
+        for _ in 2..HEADER_COUNT_SIXTY {
+            payload.extend_from_slice(&undef_hdr);
+        }
+        payload.extend_from_slice(&global);
+
+        let disk_data = thirty_sequences_to_disk(&payload, None).expect("thirty_sequences_to_disk");
+        assert_eq!(disk_data.len(), 7168, "expected 6144 header/global + 2*512 padded blocks");
+
+        // Write to disk via internal API with size_bytes set to the LOGICAL (unpadded) size,
+        // simulating hardware-written files.
+        let logical_size = 6144 + DS + DS; // 6744
+        let mut img = DiskImage::create();
+        let name_arr = {
+            let mut a = [b' '; 11];
+            a[..6].copy_from_slice(b"SEQTST");
+            a
+        };
+        let blocks = FileAllocationTable::allocate(&mut img, disk_data.len().div_ceil(512) as u16)
+            .expect("allocate");
+        for (i, &b) in blocks.iter().enumerate() {
+            let start = i * 512;
+            let end = (start + 512).min(disk_data.len());
+            let blk = img.block_mut(b).unwrap();
+            blk.fill(0);
+            blk[..end - start].copy_from_slice(&disk_data[start..end]);
+        }
+        FileAllocationTable::set_chain(&mut img, &blocks);
+        let entry = DirectoryEntry {
+            type_info: 0,
+            file_type: FileType::ThirtySequences,
+            name: name_arr,
+            _reserved: 0,
+            size_blocks: blocks.len() as u16,
+            contiguous_blocks: blocks.len() as u16,
+            first_block: blocks[0] as u32,
+            file_number: 0,
+            size_bytes: logical_size as u32,
+        };
+        SubDirectory::new(0).add(&mut img, entry).expect("add entry");
+
+        // Now extract via FFI and verify full block-aligned data is returned.
+        let img_ptr = Box::into_raw(Box::new(img)) as *mut DiskImage;
+        let name_c = CString::new("SEQTST").unwrap();
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = sd1_disk_extract(img_ptr, name_c.as_ptr(), &mut out_ptr, &mut out_len);
+        assert_eq!(rc, SD1_OK, "extract should succeed");
+        assert_eq!(out_len, disk_data.len(), "must return full block-padded length, not logical size_bytes");
+
+        // Verify the decoder succeeds with the extracted data.
+        let extracted = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+        let decoded = disk_to_thirty_sequences(extracted).expect("decode must succeed with full data");
+        assert!(!decoded.is_empty(), "decoded payload must not be empty");
+
+        sd1_bytes_free(out_ptr, out_len);
+        unsafe { drop(Box::from_raw(img_ptr as *mut DiskImage)); }
     }
 
     #[test]
