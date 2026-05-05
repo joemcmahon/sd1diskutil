@@ -429,11 +429,15 @@ int sd1_disk_to_allsequences(const uint8_t* disk, size_t len, bool has_programs,
 ```
 Reverse of the above. Set `has_programs = true` if the on-disk data includes embedded programs.
 
+The returned payload includes a fully computed 60-entry pointer table at bytes 0–239. Each entry is a 4-byte big-endian cumulative byte offset into the event data area (starting after the 12-byte event header at payload byte 252). The SD-1 firmware and MAME require these offsets to locate per-sequence event data; they are **not** rebuilt automatically from headers on receive.
+
 ```c
 int sd1_disk_to_thirty_sequences(const uint8_t* disk, size_t len,
                                   uint8_t** out, size_t* out_len);
 ```
 Convert on-disk ThirtySequences (file type `0x12`) data to a 60-slot AllSequences SysEx payload. Slots 0–29 are populated from the disk; slots 30–59 are set to undefined (`0xFF` headers). Any programs embedded after the sequence data are not included in the output. Unlike SixtySequences, ThirtySequences always stores sequence data at a fixed offset (6144 bytes), so no `has_programs` flag is needed.
+
+The returned payload includes a fully computed pointer table as described above for `sd1_disk_to_allsequences`. Slots 30–59 all receive the total event data size as their pointer value.
 
 If the on-disk global section has an all-zeros `size_sum` (a known quirk of some real hardware files), the correct value is synthesized from the sequence header data so the resulting payload is always valid.
 

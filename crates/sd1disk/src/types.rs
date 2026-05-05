@@ -307,7 +307,7 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
 ///   same header/global prefix, seq data starts at 44032 instead of 11776.
 ///
 /// Reconstructed SysEx AllSequences payload layout:
-///   [0..240]           – 240 zero bytes (internal ptr table; SD-1 rebuilds from headers)
+///   [0..240]           – 60 × 4-byte big-endian ptr table (cumulative event byte offsets)
 ///   [240..252]         – 12 zero bytes  (SD-1-internal event header; not stored on disk)
 ///   [252..252+N]       – packed sequence event data (N = sum of each sequence's ds)
 ///   [252+N..252+N+11280] – 60 × 188-byte sequence headers
@@ -335,23 +335,34 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
     let seq_data_offset = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
 
     // Unpack per-sequence event data, removing block padding.
+    // Track cumulative byte offset per slot for the ptr table.
     let mut packed_events: Vec<u8> = Vec::new();
+    let mut ptr_offsets = [0u32; HEADER_COUNT];
+    let mut offset: u32 = 0;
     let mut in_pos = seq_data_offset;
     for slot in 0..HEADER_COUNT {
+        ptr_offsets[slot] = offset;
         let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
         if hdr[0] == 0xFF { continue; }
-        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
         if ds == 0 { continue; }
-        if in_pos + ds > disk.len() {
+        if in_pos + ds as usize > disk.len() {
             return Err(Error::InvalidSysEx("on-disk SixtySequences: sequence data out of bounds"));
         }
-        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds]);
-        in_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
+        in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        offset += ds;
+    }
+
+    // Build ptr table: each slot's 4-byte big-endian cumulative byte offset into the event data.
+    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
+    for slot in 0..HEADER_COUNT {
+        ptr_table[slot * 4..(slot + 1) * 4].copy_from_slice(&ptr_offsets[slot].to_be_bytes());
     }
 
     // Reconstruct AllSequences SysEx payload.
     let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; PTR_TABLE_SIZE]);  // ptr table (zeroed; SD-1 rebuilds)
+    payload.extend_from_slice(&ptr_table);
     payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]); // SD-1-internal event header
     payload.extend_from_slice(&packed_events);
     payload.extend_from_slice(headers_sec);
@@ -371,7 +382,7 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
 ///                  Programs (if any) appear after the sequence data and are ignored here.
 ///
 /// Reconstructed SysEx AllSequences payload (60-slot format):
-///   [0..240]                  – 240 zero bytes (ptr table; SD-1 rebuilds)
+///   [0..240]                  – 60 × 4-byte big-endian ptr table (cumulative event byte offsets)
 ///   [240..252]                – 12 zero bytes (SD-1-internal event header)
 ///   [252..252+N]              – packed sequence event data
 ///   [252+N..252+N+5640]       – 30 × 188-byte sequence headers (slots 0–29)
@@ -397,18 +408,28 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     let headers_sec = &disk[..HEADERS_TOTAL];
     let global_sec  = &disk[GLOBAL_DISK_START..GLOBAL_DISK_END];
 
+    // Unpack per-sequence event data, removing block padding.
+    // Track cumulative byte offset per slot for the ptr table.
     let mut packed_events: Vec<u8> = Vec::new();
+    let mut ptr_offsets = [0u32; HEADER_COUNT_SIXTY];
+    let mut offset: u32 = 0;
     let mut in_pos = SEQ_DATA_OFFSET;
     for slot in 0..HEADER_COUNT {
+        ptr_offsets[slot] = offset;
         let hdr = &headers_sec[slot * HEADER_SIZE..(slot + 1) * HEADER_SIZE];
         if hdr[0] == 0xFF { continue; }
-        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize;
+        let ds = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
         if ds == 0 { continue; }
-        if in_pos + ds > disk.len() {
+        if in_pos + ds as usize > disk.len() {
             return Err(Error::InvalidSysEx("on-disk ThirtySequences: sequence data out of bounds"));
         }
-        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds]);
-        in_pos += (ds + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
+        in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        offset += ds;
+    }
+    // Slots 30..60 are undefined (0xFF headers); their ptr = total event data size.
+    for slot in HEADER_COUNT..HEADER_COUNT_SIXTY {
+        ptr_offsets[slot] = offset;
     }
 
     // If the on-disk global has a zeroed size_sum (real hardware quirk: ROCK-BEATS),
@@ -425,10 +446,16 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
         global_out[2..6].copy_from_slice(&bytes);
     }
 
+    // Build ptr table: each slot's 4-byte big-endian cumulative byte offset into the event data.
+    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
+    for slot in 0..HEADER_COUNT_SIXTY {
+        ptr_table[slot * 4..(slot + 1) * 4].copy_from_slice(&ptr_offsets[slot].to_be_bytes());
+    }
+
     // Reconstruct 60-slot AllSequences payload: slots 0–29 from disk, 30–59 undefined.
     let undefined_hdr = [0xFFu8; HEADER_SIZE];
     let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; PTR_TABLE_SIZE]);
+    payload.extend_from_slice(&ptr_table);
     payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
     payload.extend_from_slice(&packed_events);
     payload.extend_from_slice(headers_sec);
@@ -865,9 +892,7 @@ mod tests {
         let recovered = disk_to_allsequences(&disk, false).unwrap();
 
         // Round-trip: converting the recovered payload back to disk should
-        // produce identical bytes (modulo the 240-byte ptr table which is
-        // discarded on write and zeroed on reconstruct — both payloads have
-        // zeros there, so the disk output must match exactly).
+        // produce identical bytes (ptr table is discarded on write, so disk output matches).
         let disk2 = allsequences_to_disk(&recovered, None).unwrap();
         assert_eq!(disk, disk2, "disk→payload→disk round-trip must be lossless");
 
@@ -876,6 +901,12 @@ mod tests {
         let event_start = 240 + EVENT_LEAD;
         assert_eq!(&recovered[event_start..event_start + SEQ_DATA_LEN], seq_bytes.as_slice(),
             "recovered event data must match original");
+
+        // Ptr table: slot 0 offset = 0, slot 1..59 = SEQ_DATA_LEN (= 170 = 0xAA).
+        let ptr0 = u32::from_be_bytes(recovered[0..4].try_into().unwrap());
+        let ptr1 = u32::from_be_bytes(recovered[4..8].try_into().unwrap());
+        assert_eq!(ptr0, 0, "ptr[0] must be 0");
+        assert_eq!(ptr1, SEQ_DATA_LEN as u32, "ptr[1] must equal ds of slot 0");
     }
 
     #[test]
