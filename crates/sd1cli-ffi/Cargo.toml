@@ -1,0 +1,13 @@
+[package]
+name = "sd1cli-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sd1cli-ffi"
+path = "src/main.rs"
+
+[dependencies]
+sd1ffi  = { path = "../sd1ffi" }
+sd1disk = { path = "../sd1disk" }
+clap = { version = "4", features = ["derive"] }

@@ -331,6 +331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sd1cli-ffi"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "sd1disk",
+ "sd1ffi",
+]
+
+[[package]]
 name = "sd1disk"
 version = "0.1.0"
 

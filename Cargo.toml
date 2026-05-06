@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/sd1disk", "crates/sd1cli", "crates/sd1ffi"]
+members = ["crates/sd1disk", "crates/sd1cli", "crates/sd1ffi", "crates/sd1cli-ffi"]
 resolver = "2"
