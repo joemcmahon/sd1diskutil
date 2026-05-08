@@ -245,13 +245,13 @@ fn delete_file_not_found_returns_error() {
 /// but with ds=0, so they contribute nothing to output).
 fn make_allsequences_payload() -> Vec<u8> {
     const HEADER_COUNT: usize = 60;
-    const HEADER_SIZE: usize = 188;
+    const HEADER_SIZE: usize = 186;
     const HEADERS_TOTAL: usize = HEADER_COUNT * HEADER_SIZE;
     const SEQ_DATA_LEN: usize = 170;
-    const GLOBAL_SIZE: usize = 21;
+    const GLOBAL_SIZE: usize = 29;
     const EVENT_LEAD: usize = 12;
 
-    let size_sum: u32 = SEQ_DATA_LEN as u32 + 0xFC;
+    let declared: u32 = SEQ_DATA_LEN as u32 + EVENT_LEAD as u32;
 
     let mut headers = vec![0u8; HEADERS_TOTAL];
     // Slot 0: defined (orig_loc=0), data_size=170 at bytes 183-185
@@ -270,7 +270,7 @@ fn make_allsequences_payload() -> Vec<u8> {
     payload.extend_from_slice(&seq_bytes);          // packed seq data
     payload.extend_from_slice(&headers);
     let mut global = [0u8; GLOBAL_SIZE];
-    global[2..6].copy_from_slice(&size_sum.to_be_bytes());
+    global[10..14].copy_from_slice(&declared.to_be_bytes());
     payload.extend_from_slice(&global);
     payload
 }

@@ -1544,13 +1544,13 @@ mod tests {
         // starts at in_pos=6656 and ds=300 → end=6956 > 6744 → decode fails.
         // Without truncation (the fix), end=6956 ≤ 7168 → decode succeeds.
         const DS: usize = 300;
-        const HEADER_SIZE: usize = 188;
+        const HEADER_SIZE: usize = 186;
         const HEADER_COUNT_SIXTY: usize = 60;
         const PTR_TABLE: usize = 240;
         const EVENT_LEAD: usize = 12;
-        const GLOBAL_SIZE: usize = 21;
+        const GLOBAL_SIZE: usize = 29;
 
-        // Build two 188-byte sequence headers with ds=300 in bytes 183-185.
+        // Build two 186-byte sequence headers with ds=300 in bytes 183-185.
         let mut hdr0 = [0u8; HEADER_SIZE];
         hdr0[183] = 0; hdr0[184] = ((DS >> 8) & 0xFF) as u8; hdr0[185] = (DS & 0xFF) as u8;
         let mut hdr1 = [0u8; HEADER_SIZE];
