@@ -17,6 +17,7 @@ use sd1disk::{
     Program, Preset, Sequence,
     interleave_sixty_programs, deinterleave_sixty_programs,
     allsequences_to_disk, disk_to_allsequences, disk_to_thirty_sequences, thirty_sequences_to_disk,
+    decode_sysex_nibbles, allsequences_hardware_sysex_to_disk,
     program_name_from_slot, decode_b10,
     read_hfe, write_hfe,
 };
@@ -1140,6 +1141,63 @@ pub extern "C" fn sd1_thirty_sequences_to_disk(
             let ptr = boxed.as_mut_ptr();
             std::mem::forget(boxed);
             unsafe { *out = ptr; *out_len = len; }
+            SD1_OK
+        }
+        Err(e) => {
+            unsafe { *out = std::ptr::null_mut(); *out_len = 0; }
+            to_error_code(&e)
+        }
+    }
+}
+
+/// Nibble-decode a hardware SD-1 SysEx data section.
+/// `(hi << 4) | lo` for each consecutive pair. Output len = input len / 2 (truncated).
+/// Caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_decode_sysex_nibbles(
+    data: *const u8,
+    len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if data.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let decoded = decode_sysex_nibbles(bytes);
+    let decoded_len = decoded.len();
+    let mut boxed = decoded.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe { *out = ptr; *out_len = decoded_len; }
+    SD1_OK
+}
+
+/// Convert a hardware AllSequences SysEx dump to SD-1 on-disk SixtySequences format.
+/// Multi-message files (e.g. from SysEx Librarian) are supported; the first 0x0A message is used.
+/// If interleaved_progs is NULL, programs are not embedded.
+/// Caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_allsequences_hardware_sysex_to_disk(
+    raw: *const u8,
+    raw_len: usize,
+    interleaved_progs: *const u8,
+    progs_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if raw.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    let raw_bytes = unsafe { std::slice::from_raw_parts(raw, raw_len) };
+    let progs = if interleaved_progs.is_null() || progs_len == 0 {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(interleaved_progs, progs_len) })
+    };
+    match allsequences_hardware_sysex_to_disk(raw_bytes, progs) {
+        Ok(data) => {
+            let data_len = data.len();
+            let mut boxed = data.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out = ptr; *out_len = data_len; }
             SD1_OK
         }
         Err(e) => {

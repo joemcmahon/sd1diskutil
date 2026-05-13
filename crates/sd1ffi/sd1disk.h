@@ -441,6 +441,29 @@ int32_t sd1_thirty_sequences_to_disk(const uint8_t *payload,
                                      uintptr_t *out_len);
 
 /**
+ * Nibble-decode a hardware SD-1 SysEx data section.
+ * `(hi << 4) | lo` for each consecutive pair. Output len = input len / 2 (truncated).
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_decode_sysex_nibbles(const uint8_t *data,
+                                 uintptr_t len,
+                                 uint8_t **out,
+                                 uintptr_t *out_len);
+
+/**
+ * Convert a hardware AllSequences SysEx dump to SD-1 on-disk SixtySequences format.
+ * Multi-message files (e.g. from SysEx Librarian) are supported; the first 0x0A message is used.
+ * If interleaved_progs is NULL, programs are not embedded.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_allsequences_hardware_sysex_to_disk(const uint8_t *raw,
+                                                uintptr_t raw_len,
+                                                const uint8_t *interleaved_progs,
+                                                uintptr_t progs_len,
+                                                uint8_t **out,
+                                                uintptr_t *out_len);
+
+/**
  * Interleave 60 programs from AllPrograms SysEx payload order to on-disk SixtyPrograms format.
  * Caller must call sd1_bytes_free(*out, *out_len).
  */
