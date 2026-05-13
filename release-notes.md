@@ -1,3 +1,36 @@
+## v1.9 — Hardware SysEx import: convert SD-1 RAM dumps to disk format
+
+### New features
+
+- **`allsequences_hardware_sysex_to_disk`**: Converts a hardware AllSequences SysEx dump (nibble-encoded RAM dump as captured by SysEx Librarian or any MIDI librarian) directly to the SD-1 on-disk SixtySequences format. Multi-message files are supported; the function scans for the first AllSequences (0x0A) message and processes it.
+
+- **`decode_sysex_nibbles`**: Public utility that nibble-decodes any SD-1 hardware SysEx data section (`hi << 4 | lo` for each byte pair). Exposed in both the Rust crate and the C FFI.
+
+### Technical details
+
+Hardware AllSequences dumps differ from our generated SysEx in three ways:
+
+1. **Ptr table**: entry 0 is the base RAM address (discarded); entries 1–59 are pool offsets for seqs 0–58 (seq 59 has no ptr table entry and is always undefined in this format).
+
+2. **Event pool preamble**: the hardware pool begins with a 21-byte preamble (12 EVENT_LEAD_ZEROS + 9 bytes of pool-manager state) before sequence data. This preamble is stripped during conversion; the on-disk event section is rebuilt as clean 12-byte lead zeros + packed sequence bytes.
+
+3. **Declared size**: the hardware global's declared field includes the pool preamble. The conversion writes a clean `declared = EVENT_LEAD_ZEROS + sum(ds)` to the disk global, matching what `allsequences_to_disk` produces.
+
+Ds values are derived from the ptr table (not the sequence headers), so conversion is correct even if the hardware headers carry stale or zero ds fields.
+
+### C FFI
+
+- `sd1_decode_sysex_nibbles(data, len, out, out_len) → i32`
+- `sd1_allsequences_hardware_sysex_to_disk(raw, raw_len, interleaved_progs, progs_len, out, out_len) → i32`
+
+Both declared in `sd1disk.h`.
+
+### Testing
+
+- 146 unit/integration tests, all passing (up from 135)
+- Verified round-trip (hardware SysEx → disk → SysEx → disk) byte-for-byte identical using `~/Downloads/4.syx` (real Ensoniq SD-1 hardware dump, 21 defined sequences)
+- Synthetic tests cover: error cases, ds computation, clean declared value, event data preservation, multi-message file scanning
+
 ## v1.8 — Hardware format fix: separate SysEx and on-disk header/global sizes
 
 ### Bug fixes
