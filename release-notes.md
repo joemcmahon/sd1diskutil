@@ -1,3 +1,14 @@
+## v1.10 — Hardware SysEx import: fix declared size for files with stale ptr table entries
+
+### Bug fixes
+
+- **`allsequences_hardware_sysex_to_disk` declared size incorrect for files with deleted sequences**: Hardware ptr tables retain non-zero pool offsets for sequences that were subsequently deleted (header marked 0xFF). The `clean_declared` value was computed from all non-zero ptr table entries, making it larger than the event data actually written. Round-trip via `allsequences_to_disk` then failed with `"event data too short for declared seq_data_len"`. Fixed by filtering `sum_ds` to only count slots whose sysex header byte[0] is not 0xFF, matching the same guard used in `padded_total` and the write loop.
+
+### Testing
+
+- 147 unit/integration tests, all passing
+- Verified against Shatterday `seq-DB final (all).syx`: a real multi-message file that exhibits stale ptr table entries; now converts and round-trips correctly
+
 ## v1.9 — Hardware SysEx import: convert SD-1 RAM dumps to disk format
 
 ### New features
