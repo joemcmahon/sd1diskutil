@@ -625,6 +625,43 @@ pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u
     Ok(out)
 }
 
+/// Convert an AllSequences SysEx file to SD-1 on-disk SixtySequences format,
+/// automatically detecting whether the file is a hardware RAM dump or a
+/// library-generated SysEx.
+///
+/// Detection: after nibble-decoding the AllSequences payload, `decoded[0..4]`
+/// is the first ptr-table entry.
+/// - **Non-zero** → hardware dump (base RAM address, e.g. `0x00049000`).
+///   Routed to `allsequences_hardware_sysex_to_disk`.
+/// - **Zero** → library-generated (cumulative seq-0 offset = 0).
+///   Routed to `allsequences_to_disk`.
+///
+/// Multi-message files (e.g. from SysEx Librarian) are supported.
+/// `interleaved_programs`, if provided, must be exactly 60 × 530 = 31800 bytes.
+pub fn allsequences_sysex_to_disk(raw: &[u8], interleaved_programs: Option<&[u8]>) -> Result<Vec<u8>> {
+    // Find AllSequences message and nibble-decode its payload.
+    let msg_start = raw.windows(6)
+        .position(|w| w[0] == 0xF0 && w[1] == 0x0F && w[2] == 0x05 && w[5] == 0x0A)
+        .ok_or(Error::InvalidSysEx("SysEx: AllSequences (0x0A) message not found"))?;
+    let nibble_start = msg_start + 6;
+    let f7_offset = raw[nibble_start..].iter().position(|&b| b == 0xF7)
+        .ok_or(Error::InvalidSysEx("SysEx: missing F7 terminator"))?;
+    let decoded = decode_sysex_nibbles(&raw[nibble_start..nibble_start + f7_offset]);
+
+    if decoded.len() < 4 {
+        return Err(Error::InvalidSysEx("SysEx: AllSequences payload too short after nibble decode"));
+    }
+
+    let base_addr = u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
+    if base_addr != 0 {
+        // Hardware RAM dump: base address in ptr_table[0], pool preamble present.
+        allsequences_hardware_sysex_to_disk(raw, interleaved_programs)
+    } else {
+        // Library-generated SysEx: ptr_table[0] = 0, standard payload layout.
+        allsequences_to_disk(&decoded, interleaved_programs)
+    }
+}
+
 /// Nibble-decode a hardware SD-1 SysEx data section.
 /// Each pair of bytes `(hi, lo)` decodes to one output byte: `(hi << 4) | lo`.
 pub fn decode_sysex_nibbles(nibbles: &[u8]) -> Vec<u8> {
@@ -1602,6 +1639,90 @@ mod tests {
         let payload = disk_to_allsequences(&disk, false).expect("disk→payload");
         let disk2 = allsequences_to_disk(&payload, None).expect("payload→disk");
         assert_eq!(disk, disk2, "4.syx round-trip must be identical");
+    }
+
+    // ── allsequences_sysex_to_disk (auto-detect) ───────────────────────────────
+
+    #[test]
+    fn autodetect_routes_library_sysex_via_allsequences_to_disk() {
+        // Build a standard library-generated AllSequences SysEx (ptr_table[0] = 0).
+        // Use a simple payload with two defined sequences.
+        const DS: usize = 150;
+        const HEADER_SIZE: usize = 186;
+        const HEADER_COUNT: usize = 60;
+        const PTR_TABLE: usize = 240;
+        const EVENT_LEAD: usize = 12;
+        const GLOBAL_SIZE: usize = 29;
+
+        let mut hdr0 = [0u8; HEADER_SIZE];
+        hdr0[183] = 0; hdr0[184] = 0; hdr0[185] = DS as u8;
+        let mut hdr1 = [0u8; HEADER_SIZE];
+        hdr1[183] = 0; hdr1[184] = 0; hdr1[185] = DS as u8;
+        let undef = [0xFFu8; HEADER_SIZE];
+        let event_data: Vec<u8> = (0u8..100).cycle().take(DS * 2).collect();
+        let declared = (EVENT_LEAD + DS * 2) as u32;
+        let mut global = [0u8; GLOBAL_SIZE];
+        global[10..14].copy_from_slice(&declared.to_be_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; PTR_TABLE]); // ptr_table[0] = 0
+        payload.extend_from_slice(&[0u8; EVENT_LEAD]);
+        payload.extend_from_slice(&event_data);
+        payload.extend_from_slice(&hdr0);
+        payload.extend_from_slice(&hdr1);
+        for _ in 2..HEADER_COUNT { payload.extend_from_slice(&undef); }
+        payload.extend_from_slice(&global);
+
+        // Wrap as a SysEx message (nibble-encode)
+        let nibbles: Vec<u8> = payload.iter()
+            .flat_map(|&b| [(b >> 4) & 0x0F, b & 0x0F])
+            .collect();
+        let mut raw = vec![0xF0u8, 0x0F, 0x05, 0x00, 0x00, 0x0A];
+        raw.extend_from_slice(&nibbles);
+        raw.push(0xF7);
+
+        // Auto-detect should recognise ptr_table[0] == 0 → library path
+        let disk = allsequences_sysex_to_disk(&raw, None).expect("autodetect library path");
+        assert!(disk.len() > 11301);
+        // Round-trip must survive
+        let p2 = disk_to_allsequences(&disk, false).expect("disk→payload");
+        let d2 = allsequences_to_disk(&p2, None).expect("payload→disk");
+        assert_eq!(disk, d2);
+    }
+
+    #[test]
+    fn autodetect_routes_hardware_sysex_via_hardware_path() {
+        // Build a hardware SysEx (ptr_table[0] = non-zero base RAM addr).
+        let seq0_data: Vec<u8> = (0u8..80).collect();
+        let decoded_payload = make_hw_sysex_payload(&seq0_data);
+        let raw = wrap_hw_sysex(&decoded_payload);
+
+        // Auto-detect should recognise ptr_table[0] != 0 → hardware path
+        let disk_auto = allsequences_sysex_to_disk(&raw, None)
+            .expect("autodetect hardware path");
+        let disk_hw = allsequences_hardware_sysex_to_disk(&raw, None)
+            .expect("direct hardware path");
+        assert_eq!(disk_auto, disk_hw, "auto-detect must produce identical output to direct hardware call");
+    }
+
+    #[test]
+    fn autodetect_against_real_4syx() {
+        let path = format!("{}/Downloads/4.syx", std::env::var("HOME").unwrap_or_default());
+        let raw = match std::fs::read(&path) { Ok(b) => b, Err(_) => return };
+        let disk = allsequences_sysex_to_disk(&raw, None).expect("autodetect 4.syx");
+        let p = disk_to_allsequences(&disk, false).expect("disk→payload");
+        let d2 = allsequences_to_disk(&p, None).expect("payload→disk");
+        assert_eq!(disk, d2, "4.syx autodetect round-trip must be identical");
+    }
+
+    #[test]
+    fn autodetect_against_real_shatterday() {
+        let path = "/Volumes/Aux Brain/Music, canonical/SysEx Librarian/Shatterday/seq-DB final (all).syx";
+        let raw = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        let disk = allsequences_sysex_to_disk(&raw, None).expect("autodetect shatterday");
+        let p = disk_to_allsequences(&disk, false).expect("disk→payload");
+        let d2 = allsequences_to_disk(&p, None).expect("payload→disk");
+        assert_eq!(disk, d2, "shatterday autodetect round-trip must be identical");
     }
 
     #[test]

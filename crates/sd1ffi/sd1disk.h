@@ -441,6 +441,21 @@ int32_t sd1_thirty_sequences_to_disk(const uint8_t *payload,
                                      uintptr_t *out_len);
 
 /**
+ * Convert an AllSequences SysEx file to on-disk SixtySequences format,
+ * auto-detecting hardware RAM dump vs library-generated SysEx.
+ * Hardware dumps have a non-zero base RAM address in ptr_table[0]; library-
+ * generated files have zero. Multi-message files are supported.
+ * If interleaved_progs is NULL, programs are not embedded.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_allsequences_sysex_to_disk(const uint8_t *raw,
+                                       uintptr_t raw_len,
+                                       const uint8_t *interleaved_progs,
+                                       uintptr_t progs_len,
+                                       uint8_t **out,
+                                       uintptr_t *out_len);
+
+/**
  * Nibble-decode a hardware SD-1 SysEx data section.
  * `(hi << 4) | lo` for each consecutive pair. Output len = input len / 2 (truncated).
  * Caller must call sd1_bytes_free(*out, *out_len).

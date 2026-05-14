@@ -17,7 +17,7 @@ use sd1disk::{
     Program, Preset, Sequence,
     interleave_sixty_programs, deinterleave_sixty_programs,
     allsequences_to_disk, disk_to_allsequences, disk_to_thirty_sequences, thirty_sequences_to_disk,
-    decode_sysex_nibbles, allsequences_hardware_sysex_to_disk,
+    decode_sysex_nibbles, allsequences_hardware_sysex_to_disk, allsequences_sysex_to_disk,
     program_name_from_slot, decode_b10,
     read_hfe, write_hfe,
 };
@@ -1141,6 +1141,44 @@ pub extern "C" fn sd1_thirty_sequences_to_disk(
             let ptr = boxed.as_mut_ptr();
             std::mem::forget(boxed);
             unsafe { *out = ptr; *out_len = len; }
+            SD1_OK
+        }
+        Err(e) => {
+            unsafe { *out = std::ptr::null_mut(); *out_len = 0; }
+            to_error_code(&e)
+        }
+    }
+}
+
+/// Convert an AllSequences SysEx file to on-disk SixtySequences format,
+/// auto-detecting hardware RAM dump vs library-generated SysEx.
+/// Hardware dumps have a non-zero base RAM address in ptr_table[0]; library-
+/// generated files have zero. Multi-message files are supported.
+/// If interleaved_progs is NULL, programs are not embedded.
+/// Caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_allsequences_sysex_to_disk(
+    raw: *const u8,
+    raw_len: usize,
+    interleaved_progs: *const u8,
+    progs_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if raw.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    let raw_bytes = unsafe { std::slice::from_raw_parts(raw, raw_len) };
+    let progs = if interleaved_progs.is_null() || progs_len == 0 {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(interleaved_progs, progs_len) })
+    };
+    match allsequences_sysex_to_disk(raw_bytes, progs) {
+        Ok(data) => {
+            let data_len = data.len();
+            let mut boxed = data.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out = ptr; *out_len = data_len; }
             SD1_OK
         }
         Err(e) => {
