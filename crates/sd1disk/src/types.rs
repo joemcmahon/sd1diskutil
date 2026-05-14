@@ -726,7 +726,17 @@ pub fn allsequences_hardware_sysex_to_disk(raw: &[u8], interleaved_programs: Opt
         ds[i] = next.saturating_sub(seq_offsets[i]);
     }
 
-    let sum_ds: usize = ds.iter().map(|&d| d as usize).sum();
+    // Only count sequences that are actually written (non-0xFF header).
+    // Hardware ptr tables can have stale non-zero entries for sequences whose
+    // headers were subsequently marked undefined (0xFF) — e.g. after deletion.
+    let sum_ds: usize = (0..59usize)
+        .filter(|&slot| {
+            let d = ds[slot] as usize;
+            if d == 0 { return false; }
+            decoded[sysex_headers_start + slot * SYSEX_HEADER_SIZE] != 0xFF
+        })
+        .map(|slot| ds[slot] as usize)
+        .sum();
     // Clean declared strips the 21-byte pool preamble that hardware includes.
     let clean_declared = (EVENT_LEAD_ZEROS + sum_ds) as u32;
 
@@ -1592,5 +1602,26 @@ mod tests {
         let payload = disk_to_allsequences(&disk, false).expect("disk→payload");
         let disk2 = allsequences_to_disk(&payload, None).expect("payload→disk");
         assert_eq!(disk, disk2, "4.syx round-trip must be identical");
+    }
+
+    #[test]
+    fn hardware_sysex_to_disk_against_real_shatterday_seq_db() {
+        // Integration test: only runs if the Shatterday seq-DB file is present.
+        // Multi-message file: AllPrograms, AllPresets, button press, then AllSequences (0x0A).
+        let path = "/Volumes/Aux Brain/Music, canonical/SysEx Librarian/Shatterday/seq-DB final (all).syx";
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let disk = allsequences_hardware_sysex_to_disk(&raw, None)
+            .expect("seq-DB final (all).syx must convert without error");
+
+        assert!(disk.len() > 11301, "output must exceed header+global minimum");
+
+        // Round-trip must be byte-for-byte identical
+        let payload = disk_to_allsequences(&disk, false).expect("disk→payload");
+        let disk2 = allsequences_to_disk(&payload, None).expect("payload→disk");
+        assert_eq!(disk, disk2, "seq-DB round-trip must be identical");
     }
 }
