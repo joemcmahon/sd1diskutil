@@ -1,3 +1,14 @@
+## v1.11 — Auto-detecting AllSequences SysEx → disk conversion
+
+### New features
+
+- **`allsequences_sysex_to_disk`** / **`sd1_allsequences_sysex_to_disk`**: Single entry point that converts any AllSequences SysEx file to on-disk SixtySequences format without the caller needing to know the source format. Detection is based on `decoded[0..4]` (the first ptr-table entry after nibble-decode): a non-zero value indicates a hardware RAM dump (base 68000 address, e.g. `0x00049000`); zero indicates a library-generated file where ptr-table offsets are cumulative starting at 0. Multi-message files are supported. Dispatches to `allsequences_hardware_sysex_to_disk` or `allsequences_to_disk` accordingly.
+
+### Testing
+
+- 151 unit/integration tests, all passing
+- Auto-detect verified against both real hardware dumps (4.syx, Shatterday seq-DB) and synthetic library-generated SysEx; in all cases produces output identical to calling the format-specific function directly
+
 ## v1.10 — Hardware SysEx import: fix declared size for files with stale ptr table entries
 
 ### Bug fixes
