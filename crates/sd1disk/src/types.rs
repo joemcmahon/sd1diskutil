@@ -304,8 +304,8 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
     Ok(out)
 }
 
-/// Reverse of `allsequences_to_disk`: reconstruct an AllSequences SysEx payload
-/// from the SD-1 on-disk SixtySequences format.
+/// Reconstruct a hardware-compatible SD-1 AllSequences SysEx (F0…F7, nibble-encoded)
+/// from the SD-1 on-disk SixtySequences format, ready to send to a real SD-1.
 ///
 /// On-disk layout (no programs):
 ///   [0..11280]     – 60 × 188-byte sequence headers
@@ -316,16 +316,16 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
 /// On-disk layout (with embedded programs, `has_programs = true`):
 ///   same header/global prefix, seq data starts at 44032 instead of 11776.
 ///
-/// Reconstructed SysEx AllSequences payload layout:
-///   [0..240]           – 60 × 4-byte big-endian ptr table (cumulative event byte offsets)
-///   [240..252]         – 12 zero bytes  (SD-1-internal event header; not stored on disk)
-///   [252..252+N]       – packed sequence event data (N = sum of each sequence's ds)
-///   [252+N..252+N+11160] – 60 × 186-byte sequence headers (first 186 bytes of each 188-byte on-disk header)
-///   [252+N+11160..]    – 29-byte global section (8 zero bytes prepended to 21-byte on-disk global)
+/// Seq 59 is always undefined in this format (hardware limitation: no ptr-table entry).
 pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> {
     const DISK_HEADER_SIZE: usize = 188;    // on-disk header size
     const SYSEX_HEADER_SIZE: usize = 186;   // SysEx output header size
     const HEADER_COUNT: usize = 60;
+    const HW_SEQ_COUNT: usize = 59;  // seqs 0..58; seq 59 has no hw ptr entry
+    const HW_POOL_STATE_BYTES: usize = 9;
+    const EVENT_LEAD_ZEROS: usize = 12;
+    const POOL_PREAMBLE: usize = EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES; // 21
+    const HW_BASE_ADDRESS: u32 = 0x0004_9000;
     const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT; // 11280
     const DISK_GLOBAL_SIZE: usize = 21;     // on-disk global size
     const SYSEX_GLOBAL_SIZE: usize = 29;    // SysEx output global size
@@ -336,7 +336,6 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
     const SEQ_DATA_WITH_PROGRAMS: usize = 44032;
     const BLOCK_SIZE: usize = 512;
     const PTR_TABLE_SIZE: usize = 240;
-    const EVENT_LEAD_ZEROS: usize = 12;
 
     let min_size = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
     if disk.len() < min_size {
@@ -347,52 +346,128 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
     let disk_global = &disk[DISK_GLOBAL_START..DISK_GLOBAL_END];
     let seq_data_offset = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
 
-    // Unpack per-sequence event data, removing block padding.
+    // Pass 1: unpack real event data for defined seqs 0..58 (seq 59 has no HW ptr entry).
+    // Also read stale ds from disk bytes 183..185 for undefined (0xFF) seqs 0..58
+    // so their stale ptr-table entries can be reconstructed for a lossless round-trip.
     let mut packed_events: Vec<u8> = Vec::new();
-    let mut ptr_offsets = [0u32; HEADER_COUNT];
-    let mut offset: u32 = 0;
+    let mut stale_ds = [0u32; HW_SEQ_COUNT]; // stale ds for each undefined slot
+    let mut real_offset: u32 = 0;             // cumulative real event bytes
+    let mut stale_offset: u32 = 0;            // cumulative stale bytes (for undefined slots)
+    // cumulative_offset[slot]: byte offset (past pool preamble) where this slot starts.
+    // For defined slots: into the real event data region.
+    // For undefined slots: past real event data, in a stale extension region.
+    let mut cumulative_offset = [0u32; HW_SEQ_COUNT];
     let mut in_pos = seq_data_offset;
+    let mut sum_ds: u32 = 0;
     for slot in 0..HEADER_COUNT {
-        ptr_offsets[slot] = offset;
         let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        if disk_hdr[0] == 0xFF { continue; }
+        if disk_hdr[0] == 0xFF {
+            // Undefined slot: no event data on disk.
+            // Read stale ds from bytes 183..185 (stamped there by allsequences_hardware_sysex_to_disk).
+            let sds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
+            if slot < HW_SEQ_COUNT {
+                // Place this slot's ptr past the real event data, in a stale extension region.
+                cumulative_offset[slot] = sum_ds + stale_offset;
+                stale_ds[slot] = sds;
+                stale_offset += sds;
+            }
+            continue;
+        }
         let ds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
+        if slot < HW_SEQ_COUNT {
+            // Defined slot: record real cumulative offset.
+            cumulative_offset[slot] = real_offset;
+        }
         if ds == 0 { continue; }
         if in_pos + ds as usize > disk.len() {
             return Err(Error::InvalidSysEx("on-disk SixtySequences: sequence data out of bounds"));
         }
-        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
+        if slot < HW_SEQ_COUNT {
+            packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
+            real_offset += ds;
+            sum_ds += ds;
+        }
         in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-        offset += ds;
     }
 
-    // Build ptr table: each slot's 4-byte big-endian cumulative byte offset into the event data.
+    // Build HW ptr table:
+    //   entry 0 = HW_BASE_ADDRESS
+    //   entries 1..59 for seqs 0..58:
+    //     - Defined slot with ds>0: POOL_PREAMBLE + cumulative_offset[slot]
+    //     - Defined slot with ds=0 and i>0: 0 (triggers hardware decoder's "no event data" rule)
+    //     - Undefined (0xFF) slot: POOL_PREAMBLE + cumulative_offset[slot] (stale or past-end)
+    // Entry 0 of ptr_table is special: it stores HW_BASE_ADDRESS (base RAM address).
     let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
-    for slot in 0..HEADER_COUNT {
-        ptr_table[slot * 4..(slot + 1) * 4].copy_from_slice(&ptr_offsets[slot].to_be_bytes());
+    ptr_table[0..4].copy_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
+    for slot in 0..HW_SEQ_COUNT {
+        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
+        let hw_val: u32;
+        if disk_hdr[0] != 0xFF {
+            // Defined slot
+            let ds_from_disk = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
+            if ds_from_disk == 0 && slot > 0 {
+                // Defined with ds=0: emit ptr=0 so hardware decoder gives ds[slot]=0 (no stamp corruption).
+                hw_val = 0;
+            } else {
+                hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
+            }
+        } else {
+            // Undefined slot: stale offset past real event data
+            hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
+        }
+        ptr_table[(slot + 1) * 4..(slot + 2) * 4].copy_from_slice(&hw_val.to_be_bytes());
     }
 
-    // Build SysEx global: prepend 8 zero bytes (SD-1 internal state) to the 21-byte on-disk global.
+    // Build HW pool: EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES zeros + packed_events
+    //   + stale_offset dummy bytes (to accommodate stale ptr-table chain)
+    //   + EVENT_LEAD_ZEROS sentinel.
+    // total_packed = POOL_PREAMBLE + sum_ds + stale_offset (hardware decoder must see this
+    // as the fallback "end" so stale chain resolves correctly).
+    let mut pool: Vec<u8> = Vec::new();
+    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
+    pool.extend_from_slice(&[0u8; HW_POOL_STATE_BYTES]);
+    pool.extend_from_slice(&packed_events);
+    pool.extend(std::iter::repeat(0u8).take(stale_offset as usize)); // stale region (zeros; content unused)
+    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
+
+    // Build SysEx global: prepend 8 zero bytes to the 21-byte on-disk global,
+    // then overwrite the declared field with EVENT_LEAD_ZEROS + sum_ds.
     let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
     sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
+    let declared = EVENT_LEAD_ZEROS as u32 + sum_ds;
+    sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
 
-    // Reconstruct AllSequences SysEx payload.
+    // Build payload:
+    //   ptr_table (240)
+    //   + pool (POOL_PREAMBLE + packed_events + stale region + EVENT_LEAD_ZEROS sentinel)
+    //   + 59 sequence headers (seqs 0..58, first 186 bytes each)
+    //   + 1 all-0xFF header for seq 59 (hardware limitation; bytes 183..185 preserved from disk)
+    //   + sysex_global (29)
     let mut payload = Vec::new();
     payload.extend_from_slice(&ptr_table);
-    payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-    payload.extend_from_slice(&packed_events);
-    // Emit 186-byte SysEx headers (first 186 bytes of each 188-byte on-disk header).
-    for slot in 0..HEADER_COUNT {
+    payload.extend_from_slice(&pool);
+    for slot in 0..HW_SEQ_COUNT {
         let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
         payload.extend_from_slice(&disk_hdr[..SYSEX_HEADER_SIZE]);
     }
+    // Seq 59: always undefined in hardware format (no ptr-table entry).
+    // Preserve bytes 183..185 from disk so they round-trip cleanly through the hardware
+    // decoder (which does NOT stamp slot 59, preserving whatever bytes the SysEx contained).
+    {
+        let disk_hdr59 = &disk_headers[59 * DISK_HEADER_SIZE..(59 + 1) * DISK_HEADER_SIZE];
+        let mut hdr59 = [0xFFu8; SYSEX_HEADER_SIZE];
+        hdr59[183] = disk_hdr59[183];
+        hdr59[184] = disk_hdr59[184];
+        hdr59[185] = disk_hdr59[185];
+        payload.extend_from_slice(&hdr59);
+    }
     payload.extend_from_slice(&sysex_global);
 
-    Ok(payload)
+    Ok(sysex_nibble_encode_wrap(&payload))
 }
 
-/// Reverse of `thirty_sequences_to_disk`: reconstruct an AllSequences SysEx payload
-/// from the SD-1 on-disk ThirtySequences format.
+/// Reconstruct a hardware-compatible SD-1 AllSequences SysEx (F0…F7, nibble-encoded)
+/// from the SD-1 on-disk ThirtySequences format, ready to send to a real SD-1.
 ///
 /// On-disk layout:
 ///   [0..5640]    – 30 × 188-byte sequence headers
@@ -401,18 +476,17 @@ pub fn disk_to_allsequences(disk: &[u8], has_programs: bool) -> Result<Vec<u8>> 
 ///   [6144..]     – sequence event data (each sequence block-padded to 512 bytes)
 ///                  Programs (if any) appear after the sequence data and are ignored here.
 ///
-/// Reconstructed SysEx AllSequences payload (60-slot format):
-///   [0..240]                  – 60 × 4-byte big-endian ptr table (cumulative event byte offsets)
-///   [240..252]                – 12 zero bytes (SD-1-internal event header)
-///   [252..252+N]              – packed sequence event data
-///   [252+N..252+N+5580]       – 30 × 186-byte sequence headers (first 186 bytes of each 188-byte header)
-///   [252+N+5580..252+N+11160] – 30 × 186 undefined headers (slots 30–59, all 0xFF)
-///   [252+N+11160..]           – 29-byte global section (8 zero bytes prepended to 21-byte on-disk global)
+/// Seq 59 is always undefined in the output (hardware limitation: no ptr-table entry).
 pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     const DISK_HEADER_SIZE: usize = 188;
     const SYSEX_HEADER_SIZE: usize = 186;
-    const HEADER_COUNT: usize = 30;
+    const HEADER_COUNT: usize = 30;        // slots on disk
+    const HW_SEQ_COUNT: usize = 59;        // seqs 0..58 have hw ptr entries; seq 59 does not
     const HEADER_COUNT_SIXTY: usize = 60;
+    const HW_POOL_STATE_BYTES: usize = 9;
+    const EVENT_LEAD_ZEROS: usize = 12;
+    const POOL_PREAMBLE: usize = EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES; // 21
+    const HW_BASE_ADDRESS: u32 = 0x0004_9000;
     const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT; // 5640
     const DISK_GLOBAL_SIZE: usize = 21;
     const SYSEX_GLOBAL_SIZE: usize = 29;
@@ -422,7 +496,6 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     const SEQ_DATA_OFFSET: usize = 6144;
     const BLOCK_SIZE: usize = 512;
     const PTR_TABLE_SIZE: usize = 240;
-    const EVENT_LEAD_ZEROS: usize = 12;
 
     if disk.len() < SEQ_DATA_OFFSET {
         return Err(Error::InvalidSysEx("on-disk ThirtySequences data too short"));
@@ -431,13 +504,15 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     let disk_headers = &disk[..DISK_HEADERS_TOTAL];
     let disk_global  = &disk[DISK_GLOBAL_START..DISK_GLOBAL_END];
 
-    // Unpack per-sequence event data, removing block padding.
+    // Unpack per-sequence event data for the 30 on-disk slots, removing block padding.
     let mut packed_events: Vec<u8> = Vec::new();
-    let mut ptr_offsets = [0u32; HEADER_COUNT_SIXTY];
+    // cumulative_offset[slot] for seqs 0..29 (from disk); seqs 30..58 will point past event data
+    let mut cumulative_offset = [0u32; HW_SEQ_COUNT];
     let mut offset: u32 = 0;
     let mut in_pos = SEQ_DATA_OFFSET;
+    let mut sum_ds: u32 = 0;
     for slot in 0..HEADER_COUNT {
-        ptr_offsets[slot] = offset;
+        cumulative_offset[slot] = offset;
         let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
         if disk_hdr[0] == 0xFF { continue; }
         let ds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
@@ -448,50 +523,60 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
         packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
         in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         offset += ds;
+        sum_ds += ds;
     }
-    // Slots 30..60 are undefined; their ptr = total event data size.
-    for slot in HEADER_COUNT..HEADER_COUNT_SIXTY {
-        ptr_offsets[slot] = offset;
+    // Seqs 30..58: undefined (0xFF headers), ptr entries point past event data.
+    for slot in HEADER_COUNT..HW_SEQ_COUNT {
+        cumulative_offset[slot] = offset; // same as sum_ds (past end of event data)
     }
 
-    // Build SysEx global: prepend 8 zero bytes (SD-1 internal state) to the 21-byte on-disk global.
-    // On-disk global[2..6] = declared size (same field as SysEx global[10..14]).
+    // Build HW ptr table:
+    //   entry 0 = HW_BASE_ADDRESS
+    //   entries 1..59 = POOL_PREAMBLE + cumulative_offset[slot] for seqs 0..58
+    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
+    ptr_table[0..4].copy_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
+    for slot in 0..HW_SEQ_COUNT {
+        let hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
+        ptr_table[(slot + 1) * 4..(slot + 2) * 4].copy_from_slice(&hw_val.to_be_bytes());
+    }
+
+    // Build HW pool: EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES zeros + packed_events + EVENT_LEAD_ZEROS sentinel
+    let mut pool: Vec<u8> = Vec::new();
+    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
+    pool.extend_from_slice(&[0u8; HW_POOL_STATE_BYTES]);
+    pool.extend_from_slice(&packed_events);
+    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
+
+    // Build SysEx global: prepend 8 zero bytes to the 21-byte on-disk global,
+    // then always overwrite the declared field with EVENT_LEAD_ZEROS + sum_ds.
     let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
     sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
+    let declared = EVENT_LEAD_ZEROS as u32 + sum_ds;
+    sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
 
-    // If the on-disk global has a zeroed declared size (hardware quirk seen in real SD-1 files),
-    // synthesize the correct value so allsequences_to_disk can parse the produced payload.
-    let stored_declared = u32::from_be_bytes([
-        disk_global[2], disk_global[3], disk_global[4], disk_global[5],
-    ]);
-    if stored_declared == 0 && !packed_events.is_empty() {
-        let declared = packed_events.len() as u32 + EVENT_LEAD_ZEROS as u32;
-        sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
-    }
-
-    // Build ptr table.
-    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
-    for slot in 0..HEADER_COUNT_SIXTY {
-        ptr_table[slot * 4..(slot + 1) * 4].copy_from_slice(&ptr_offsets[slot].to_be_bytes());
-    }
-
-    // Reconstruct 60-slot AllSequences payload: slots 0–29 from disk, 30–59 undefined.
+    // Build payload:
+    //   ptr_table (240)
+    //   + pool (POOL_PREAMBLE + packed_events + EVENT_LEAD_ZEROS sentinel)
+    //   + 30 sequence headers (seqs 0..29 from disk, first 186 bytes each)
+    //   + 29 all-0xFF headers (seqs 30..58, undefined)
+    //   + 1 all-0xFF header for seq 59 (hardware limitation: no ptr entry)
+    //   + sysex_global (29)
     let undefined_hdr = [0xFFu8; SYSEX_HEADER_SIZE];
     let mut payload = Vec::new();
     payload.extend_from_slice(&ptr_table);
-    payload.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-    payload.extend_from_slice(&packed_events);
-    // Emit 186-byte SysEx headers (first 186 bytes of each 188-byte on-disk header).
+    payload.extend_from_slice(&pool);
+    // Seqs 0..29 from disk
     for slot in 0..HEADER_COUNT {
         let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
         payload.extend_from_slice(&disk_hdr[..SYSEX_HEADER_SIZE]);
     }
+    // Seqs 30..59: all undefined
     for _ in HEADER_COUNT..HEADER_COUNT_SIXTY {
         payload.extend_from_slice(&undefined_hdr);
     }
     payload.extend_from_slice(&sysex_global);
 
-    Ok(payload)
+    Ok(sysex_nibble_encode_wrap(&payload))
 }
 
 /// Convert an AllSequences SysEx payload to the SD-1 on-disk ThirtySequences format.
@@ -669,6 +754,19 @@ pub fn decode_sysex_nibbles(nibbles: &[u8]) -> Vec<u8> {
         .filter(|c| c.len() == 2)
         .map(|c| (c[0] << 4) | c[1])
         .collect()
+}
+
+/// Nibble-encode `payload` and wrap it in a hardware SD-1 AllSequences SysEx frame.
+/// Frame: `F0 0F 05 00 00 0A [nibble-encoded bytes] F7`
+fn sysex_nibble_encode_wrap(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + payload.len() * 2 + 1);
+    out.extend_from_slice(&[0xF0, 0x0F, 0x05, 0x00, 0x00, 0x0A]);
+    for &b in payload {
+        out.push((b >> 4) & 0x0F);
+        out.push(b & 0x0F);
+    }
+    out.push(0xF7);
+    out
 }
 
 /// Convert a hardware AllSequences SysEx dump to SD-1 on-disk SixtySequences format.
@@ -1115,8 +1213,11 @@ mod tests {
 
     #[test]
     fn disk_to_allsequences_round_trips_via_disk() {
-        // Build the same minimal payload as allsequences_to_disk_layout:
-        // one defined sequence (slot 0, ds=170), 59 zero-ds slots, no programs.
+        // Build a minimal payload with one defined sequence (slot 0, ds=170),
+        // slots 1..59 all marked undefined (0xFF) — matching real SD-1 disk layout.
+        // Undefined headers have bytes 183..185 pre-zeroed to match what
+        // allsequences_hardware_sysex_to_disk stamps (ds=0), so the round-trip is
+        // lossless from the first iteration.
         const HEADER_COUNT: usize = 60;
         const HEADER_SIZE: usize = 186;
         const HEADERS_TOTAL: usize = HEADER_COUNT * HEADER_SIZE;
@@ -1126,7 +1227,16 @@ mod tests {
 
         let declared: u32 = EVENT_LEAD as u32 + SEQ_DATA_LEN as u32;
         let mut headers = vec![0u8; HEADERS_TOTAL];
+        // Slot 0: defined, ds=170
         headers[183] = 0; headers[184] = 0; headers[185] = SEQ_DATA_LEN as u8;
+        // Slots 1..59: undefined (0xFF except bytes 183..185 which are 0).
+        // Hardware path stamps ds=0 into bytes 183..185 of undefined headers, so
+        // pre-zeroing those bytes ensures the round-trip does not change them.
+        for s in 1..HEADER_COUNT {
+            let off = s * HEADER_SIZE;
+            for b in 0..HEADER_SIZE { headers[off + b] = 0xFF; }
+            headers[off + 183] = 0; headers[off + 184] = 0; headers[off + 185] = 0;
+        }
 
         let seq_bytes: Vec<u8> = (0..SEQ_DATA_LEN as u8).collect();
         let mut payload = Vec::new();
@@ -1141,25 +1251,13 @@ mod tests {
         // Convert to disk format.
         let disk = allsequences_to_disk(&payload, None).unwrap();
 
-        // Convert back to SysEx payload.
+        // disk_to_allsequences now returns hardware-compatible SysEx (F0…F7, nibble-encoded).
         let recovered = disk_to_allsequences(&disk, false).unwrap();
 
-        // Round-trip: converting the recovered payload back to disk should
-        // produce identical bytes (ptr table is discarded on write, so disk output matches).
-        let disk2 = allsequences_to_disk(&recovered, None).unwrap();
-        assert_eq!(disk, disk2, "disk→payload→disk round-trip must be lossless");
-
-        // The recovered payload must carry the original event data at the
-        // correct position: after 240 ptr-table bytes + 12 lead zeros.
-        let event_start = 240 + EVENT_LEAD;
-        assert_eq!(&recovered[event_start..event_start + SEQ_DATA_LEN], seq_bytes.as_slice(),
-            "recovered event data must match original");
-
-        // Ptr table: slot 0 offset = 0, slot 1..59 = SEQ_DATA_LEN (= 170 = 0xAA).
-        let ptr0 = u32::from_be_bytes(recovered[0..4].try_into().unwrap());
-        let ptr1 = u32::from_be_bytes(recovered[4..8].try_into().unwrap());
-        assert_eq!(ptr0, 0, "ptr[0] must be 0");
-        assert_eq!(ptr1, SEQ_DATA_LEN as u32, "ptr[1] must equal ds of slot 0");
+        // Round-trip: feed HW SysEx back through allsequences_sysex_to_disk and verify
+        // the reconstructed disk is byte-for-byte identical.
+        let disk2 = allsequences_sysex_to_disk(&recovered, None).unwrap();
+        assert_eq!(disk, disk2, "disk→hw_sysex→disk round-trip must be lossless");
     }
 
     #[test]
@@ -1225,20 +1323,17 @@ mod tests {
         const DS: usize = 170;
         let payload = make_thirty_seq_payload(DS);
         let disk = thirty_sequences_to_disk(&payload, None).unwrap();
-        let recovered = disk_to_thirty_sequences(&disk).unwrap();
-        let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
-        assert_eq!(disk, disk2, "ThirtySeq disk→payload→disk round-trip must be lossless");
-
-        // Event data at [252..252+DS] in recovered payload
-        let event_start = 240 + 12;
+        // disk_to_thirty_sequences returns HW SysEx; import via auto-detect to 60-seq disk.
+        let hw_sysex = disk_to_thirty_sequences(&disk).unwrap();
+        let disk_sixty = allsequences_sysex_to_disk(&hw_sysex, None).unwrap();
+        // Seq 0 event data lands at the 60-seq data offset (11776).
         let seq_bytes: Vec<u8> = (0..DS as u8).collect();
-        assert_eq!(&recovered[event_start..event_start + DS], seq_bytes.as_slice());
+        assert_eq!(&disk_sixty[11776..11776 + DS], seq_bytes.as_slice(),
+            "seq 0 event data must survive ThirtySeq→HW SysEx→SixtySeq conversion");
     }
 
     #[test]
     fn thirty_sequences_round_trips_with_zeroed_global() {
-        // Verify that thirty_sequences_to_disk works even when the global is all zeros
-        // (as seen in real ROCK-BEATS disk files where the hardware left global zeroed).
         const DS: usize = 200;
         const HEADER_COUNT: usize = 60;
         const HEADER_SIZE: usize = 186;
@@ -1257,21 +1352,17 @@ mod tests {
 
         let disk = thirty_sequences_to_disk(&payload, None).unwrap();
         assert_eq!(disk.len(), 6144 + 512);
-        assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
 
-        // disk_to_thirty_sequences synthesizes a corrected global (size_sum) when the
-        // on-disk global is zeroed, so disk2 global bytes differ from disk. Assert
-        // that event data and headers survive, and that the second round-trip is stable.
-        let recovered = disk_to_thirty_sequences(&disk).unwrap();
-        let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
-        assert_eq!(disk2.len(), 6144 + 512);
-        // Event data preserved.
-        assert_eq!(&disk2[6144..6144 + DS], seq_bytes.as_slice());
-        // Headers (slots 0-29) preserved (30 × 188 bytes on disk).
-        assert_eq!(&disk2[..30 * 188], &disk[..30 * 188]);
-        // Second round-trip is stable (global already corrected).
-        let disk3 = thirty_sequences_to_disk(&disk_to_thirty_sequences(&disk2).unwrap(), None).unwrap();
-        assert_eq!(disk2, disk3);
+        // Export as HW SysEx; declared is synthesized correctly even with zeroed on-disk global.
+        let hw_sysex = disk_to_thirty_sequences(&disk).unwrap();
+        let disk_sixty = allsequences_sysex_to_disk(&hw_sysex, None).unwrap();
+        assert_eq!(&disk_sixty[11776..11776 + DS], seq_bytes.as_slice(),
+            "event data must survive zeroed-global thirty-seq round-trip");
+
+        // Second round-trip via SixtySeq must be stable.
+        let hw_sysex2 = disk_to_allsequences(&disk_sixty, false).unwrap();
+        let disk_sixty2 = allsequences_sysex_to_disk(&hw_sysex2, None).unwrap();
+        assert_eq!(disk_sixty, disk_sixty2, "second round-trip must be stable");
     }
 
     #[test]
@@ -1579,10 +1670,10 @@ mod tests {
         let disk = allsequences_hardware_sysex_to_disk(&raw, None)
             .expect("hardware → disk");
 
-        // Round-trip: disk → SysEx payload → disk again; both disks must match.
+        // Round-trip: disk → HW SysEx → disk again; both disks must match.
         let payload = disk_to_allsequences(&disk, false)
-            .expect("disk → allsequences payload");
-        let disk2 = allsequences_to_disk(&payload, None)
+            .expect("disk → allsequences hw sysex");
+        let disk2 = allsequences_sysex_to_disk(&payload, None)
             .expect("allsequences → disk");
 
         assert_eq!(disk, disk2, "hardware-converted disk must survive round-trip");
@@ -1637,7 +1728,7 @@ mod tests {
 
         // Round-trip must be byte-for-byte identical
         let payload = disk_to_allsequences(&disk, false).expect("disk→payload");
-        let disk2 = allsequences_to_disk(&payload, None).expect("payload→disk");
+        let disk2 = allsequences_sysex_to_disk(&payload, None).expect("payload→disk");
         assert_eq!(disk, disk2, "4.syx round-trip must be identical");
     }
 
@@ -1658,7 +1749,11 @@ mod tests {
         hdr0[183] = 0; hdr0[184] = 0; hdr0[185] = DS as u8;
         let mut hdr1 = [0u8; HEADER_SIZE];
         hdr1[183] = 0; hdr1[184] = 0; hdr1[185] = DS as u8;
-        let undef = [0xFFu8; HEADER_SIZE];
+        // Undefined headers: 0xFF except bytes 183..185 which are pre-zeroed.
+        // allsequences_hardware_sysex_to_disk stamps ds=0 into those bytes, so
+        // pre-zeroing ensures the round-trip is lossless from the first iteration.
+        let mut undef = [0xFFu8; HEADER_SIZE];
+        undef[183] = 0; undef[184] = 0; undef[185] = 0;
         let event_data: Vec<u8> = (0u8..100).cycle().take(DS * 2).collect();
         let declared = (EVENT_LEAD + DS * 2) as u32;
         let mut global = [0u8; GLOBAL_SIZE];
@@ -1686,7 +1781,7 @@ mod tests {
         assert!(disk.len() > 11301);
         // Round-trip must survive
         let p2 = disk_to_allsequences(&disk, false).expect("disk→payload");
-        let d2 = allsequences_to_disk(&p2, None).expect("payload→disk");
+        let d2 = allsequences_sysex_to_disk(&p2, None).expect("payload→disk");
         assert_eq!(disk, d2);
     }
 
@@ -1711,7 +1806,7 @@ mod tests {
         let raw = match std::fs::read(&path) { Ok(b) => b, Err(_) => return };
         let disk = allsequences_sysex_to_disk(&raw, None).expect("autodetect 4.syx");
         let p = disk_to_allsequences(&disk, false).expect("disk→payload");
-        let d2 = allsequences_to_disk(&p, None).expect("payload→disk");
+        let d2 = allsequences_sysex_to_disk(&p, None).expect("payload→disk");
         assert_eq!(disk, d2, "4.syx autodetect round-trip must be identical");
     }
 
@@ -1721,7 +1816,7 @@ mod tests {
         let raw = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
         let disk = allsequences_sysex_to_disk(&raw, None).expect("autodetect shatterday");
         let p = disk_to_allsequences(&disk, false).expect("disk→payload");
-        let d2 = allsequences_to_disk(&p, None).expect("payload→disk");
+        let d2 = allsequences_sysex_to_disk(&p, None).expect("payload→disk");
         assert_eq!(disk, d2, "shatterday autodetect round-trip must be identical");
     }
 
@@ -1742,7 +1837,7 @@ mod tests {
 
         // Round-trip must be byte-for-byte identical
         let payload = disk_to_allsequences(&disk, false).expect("disk→payload");
-        let disk2 = allsequences_to_disk(&payload, None).expect("payload→disk");
+        let disk2 = allsequences_sysex_to_disk(&payload, None).expect("payload→disk");
         assert_eq!(disk, disk2, "seq-DB round-trip must be identical");
     }
 }

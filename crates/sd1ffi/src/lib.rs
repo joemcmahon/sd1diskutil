@@ -1056,7 +1056,9 @@ pub extern "C" fn sd1_allsequences_to_disk(
     }
 }
 
-/// Convert on-disk SixtySequences data back to an AllSequences SysEx payload.
+/// Convert on-disk SixtySequences data to a hardware-compatible SD-1 AllSequences SysEx
+/// (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
+/// Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
 /// Caller must call sd1_bytes_free(*out, *out_len).
 #[no_mangle]
 pub extern "C" fn sd1_disk_to_allsequences(
@@ -1084,8 +1086,10 @@ pub extern "C" fn sd1_disk_to_allsequences(
     }
 }
 
-/// Convert on-disk ThirtySequences data to an AllSequences SysEx payload (60-slot format).
+/// Convert on-disk ThirtySequences data to a hardware-compatible SD-1 AllSequences SysEx
+/// (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
 /// Slots 0–29 are populated from disk; slots 30–59 are set to undefined (0xFF headers).
+/// Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
 /// Programs embedded after sequence data (if any) are not included in the output.
 /// Caller must call sd1_bytes_free(*out, *out_len).
 #[no_mangle]

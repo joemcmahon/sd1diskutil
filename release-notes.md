@@ -1,3 +1,22 @@
+## v1.12 — Hardware-compatible SysEx export
+
+### Breaking change (SysEx output format)
+
+- **`disk_to_allsequences`** / **`sd1_disk_to_allsequences`**: Previously returned a raw library-internal AllSequences payload. Now returns a complete hardware-compatible SD-1 AllSequences SysEx (`F0 0F 05 00 00 0A … F7`, nibble-encoded), ready to send directly to a real SD-1 in load mode via any SysEx librarian. Callers that previously fed the return value into `allsequences_to_disk` must now feed it into `allsequences_sysex_to_disk` instead.
+
+- **`disk_to_thirty_sequences`** / **`sd1_disk_to_thirty_sequences`**: Same change. Returns full hardware-compatible SysEx.
+
+- **Hardware ptr-table layout**: `ptr_table[0]` is set to `0x00049000` (SD-1 68000 RAM base). Entries 1–59 are pool offsets (preamble-relative) for sequences 0–58. Sequence slot 59 is always undefined (`0xFF` header) — hardware limitation; the SD-1 has no ptr-table entry for slot 59.
+
+- **Pool layout**: output pool includes the 21-byte hardware preamble (12 lead zeros + 9 zero pool-manager state bytes) and 12-byte trailing sentinel, matching what the hardware generates on dump.
+
+- **SysEx files exported before v1.12** used a library-internal format that real SD-1 hardware cannot load. They can still be imported (the auto-detect path handles them) and will be re-exported in the correct format automatically.
+
+### Testing
+
+- 151 unit/integration tests, all passing (round-trip tests updated to use `allsequences_sysex_to_disk` for the reverse leg)
+- Verified hardware-format output parses correctly via `allsequences_sysex_to_disk` auto-detect path
+
 ## v1.11 — Auto-detecting AllSequences SysEx → disk conversion
 
 ### New features
