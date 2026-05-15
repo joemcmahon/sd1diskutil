@@ -1,3 +1,30 @@
+## v1.13 — Explicit hardware SysEx export; lossless default restored
+
+### Breaking change (reverts v1.12 behavior)
+
+- **`disk_to_allsequences`** / **`sd1_disk_to_allsequences`**: Reverted to lossless library-format payload (all 60 sequence slots, including slot 59). Output feeds back into `allsequences_to_disk` for VST-to-VST and image-to-image transfers without data loss. This is the correct default for VST use. Not hardware-compatible — do not send directly to a real SD-1.
+
+- **`disk_to_thirty_sequences`** / **`sd1_disk_to_thirty_sequences`**: Same revert. Lossless, all 60 slots (30 defined + 30 undefined), not hardware-compatible.
+
+### New features
+
+- **`disk_to_allsequences_hw_sysex(disk, has_programs, allow_slot59_loss)`** / **`sd1_disk_to_allsequences_hw_sysex`**: Explicit hardware-compatible AllSequences SysEx export (`F0 0F 05 00 00 0A … F7`, nibble-encoded). Slot 59 is always undefined in hardware SysEx format (hardware ptr-table limitation — the SD-1 itself cannot capture slot 59 in an AllSequences dump). If slot 59 has sequence data and `allow_slot59_loss` is `false`, returns `SD1_ERR_SLOT59_HAS_DATA (-17)` so the caller can warn the user. Pass `allow_slot59_loss = true` to proceed after warning.
+
+- **`disk_to_thirty_sequences_hw_sysex(disk, allow_slot59_loss)`** / **`sd1_disk_to_thirty_sequences_hw_sysex`**: Same for ThirtySequences on-disk format.
+
+- **`SD1_ERR_SLOT59_HAS_DATA` (-17)**: New error code returned when a hardware SysEx export is attempted with slot 59 populated and `allow_slot59_loss = false`.
+
+### Background
+
+v1.12 made `disk_to_allsequences` emit hardware SysEx by default. This was lossy: the SD-1 hardware SysEx format has no ptr-table entry for slot 59, so any sequence data there is silently dropped. For VST users moving data between images, silent data loss is unacceptable. v1.13 restores the lossless default and makes hardware export an explicit, opt-in call with a clear error when lossy conversion would occur.
+
+Empirical check against all Shatterday and Ocean Music hardware dumps confirmed slot 59 is always 0xFF in genuine SD-1 hardware dumps — the hardware itself never populates it in AllSequences SysEx.
+
+### Testing
+
+- 157 unit/integration tests, all passing (116 sd1disk, 11 sd1cli, 30 sd1ffi)
+- 6 new tests: slot 59 empty/blocked/allowed cases for both new hw_sysex functions
+
 ## v1.12 — Hardware-compatible SysEx export
 
 ### Breaking change (SysEx output format)
