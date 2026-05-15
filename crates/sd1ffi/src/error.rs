@@ -17,6 +17,7 @@ pub const SD1_ERR_INVALID_HFE: i32     = -13;
 pub const SD1_ERR_HFE_CRC: i32         = -14;
 pub const SD1_ERR_HFE_MISSING_SEC: i32 = -15;
 pub const SD1_ERR_IO: i32              = -16;
+pub const SD1_ERR_SLOT59_HAS_DATA: i32 = -17;
 
 pub fn to_error_code(e: &Error) -> i32 {
     match e {
@@ -36,6 +37,7 @@ pub fn to_error_code(e: &Error) -> i32 {
         Error::HfeCrcMismatch { .. }    => SD1_ERR_HFE_CRC,
         Error::HfeMissingSector { .. }  => SD1_ERR_HFE_MISSING_SEC,
         Error::Io(_)                    => SD1_ERR_IO,
+        Error::Slot59HasData            => SD1_ERR_SLOT59_HAS_DATA,
     }
 }
 
@@ -59,6 +61,7 @@ pub fn error_message(code: i32) -> &'static str {
         SD1_ERR_HFE_CRC           => "HFE CRC mismatch",
         SD1_ERR_HFE_MISSING_SEC   => "HFE missing sector",
         SD1_ERR_IO                => "I/O error",
+        SD1_ERR_SLOT59_HAS_DATA   => "sequence slot 59 has data that cannot be encoded in hardware SysEx format",
         _                         => "unknown error",
     }
 }

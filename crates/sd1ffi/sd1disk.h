@@ -69,6 +69,8 @@ typedef struct Sequence     Sd1Sequence;
 
 #define SD1_ERR_IO -16
 
+#define SD1_ERR_SLOT59_HAS_DATA -17
+
 /**
  * C-compatible directory entry. Mirrors sd1disk::DirectoryEntry.
  */
@@ -406,9 +408,9 @@ int32_t sd1_allsequences_to_disk(const uint8_t *payload,
                                  uintptr_t *out_len);
 
 /**
- * Convert on-disk SixtySequences data to a hardware-compatible SD-1 AllSequences SysEx
- * (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
- * Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
+ * Convert on-disk SixtySequences data to a lossless library-format AllSequences SysEx payload.
+ * Output: ptr table (240) + 12 lead zeros + packed event data + 60 × 186-byte headers + 29-byte global.
+ * This is the raw payload format, not framed or nibble-encoded; it feeds into allsequences_to_disk.
  * Caller must call sd1_bytes_free(*out, *out_len).
  */
 int32_t sd1_disk_to_allsequences(const uint8_t *disk,
@@ -418,10 +420,9 @@ int32_t sd1_disk_to_allsequences(const uint8_t *disk,
                                  uintptr_t *out_len);
 
 /**
- * Convert on-disk ThirtySequences data to a hardware-compatible SD-1 AllSequences SysEx
- * (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
- * Slots 0–29 are populated from disk; slots 30–59 are set to undefined (0xFF headers).
- * Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
+ * Convert on-disk ThirtySequences data to a lossless library-format AllSequences SysEx payload.
+ * Slots 0–29 come from disk; slots 30–59 are set to undefined (0xFF headers).
+ * Output is the raw 60-slot payload (ptr table + event data + headers + global), not framed.
  * Programs embedded after sequence data (if any) are not included in the output.
  * Caller must call sd1_bytes_free(*out, *out_len).
  */
@@ -429,6 +430,32 @@ int32_t sd1_disk_to_thirty_sequences(const uint8_t *disk,
                                      uintptr_t len,
                                      uint8_t **out,
                                      uintptr_t *out_len);
+
+/**
+ * Convert on-disk SixtySequences data to a hardware-compatible SD-1 AllSequences SysEx
+ * (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
+ * Sequence slot 59 is always undefined in hardware SysEx format (hardware limitation).
+ * If slot 59 has sequence data and allow_slot59_loss is false, returns SD1_ERR_SLOT59_HAS_DATA.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_disk_to_allsequences_hw_sysex(const uint8_t *disk,
+                                          uintptr_t len,
+                                          bool has_programs,
+                                          bool allow_slot59_loss,
+                                          uint8_t **out,
+                                          uintptr_t *out_len);
+
+/**
+ * Convert on-disk ThirtySequences data to a hardware-compatible SD-1 AllSequences SysEx.
+ * Slots 0–29 from disk; slots 30–59 undefined. Slot 59 hardware limitation applies.
+ * If slot 59 has sequence data and allow_slot59_loss is false, returns SD1_ERR_SLOT59_HAS_DATA.
+ * Caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_disk_to_thirty_sequences_hw_sysex(const uint8_t *disk,
+                                              uintptr_t len,
+                                              bool allow_slot59_loss,
+                                              uint8_t **out,
+                                              uintptr_t *out_len);
 
 /**
  * Convert an AllSequences SysEx payload to on-disk ThirtySequences format.

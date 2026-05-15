@@ -16,7 +16,9 @@ use sd1disk::{
     SysExPacket,
     Program, Preset, Sequence,
     interleave_sixty_programs, deinterleave_sixty_programs,
-    allsequences_to_disk, disk_to_allsequences, disk_to_thirty_sequences, thirty_sequences_to_disk,
+    allsequences_to_disk, disk_to_allsequences, disk_to_thirty_sequences,
+    disk_to_allsequences_hw_sysex, disk_to_thirty_sequences_hw_sysex,
+    thirty_sequences_to_disk,
     decode_sysex_nibbles, allsequences_hardware_sysex_to_disk, allsequences_sysex_to_disk,
     program_name_from_slot, decode_b10,
     read_hfe, write_hfe,
@@ -54,6 +56,7 @@ pub extern "C" fn sd1_error_message(code: i32) -> *const c_char {
         -14 => cstr!("HFE CRC mismatch"),
         -15 => cstr!("HFE missing sector"),
         -16 => cstr!("I/O error"),
+        -17 => cstr!("sequence slot 59 has data that cannot be encoded in hardware SysEx format"),
         _   => cstr!("unknown error"),
     }
 }
@@ -1056,9 +1059,9 @@ pub extern "C" fn sd1_allsequences_to_disk(
     }
 }
 
-/// Convert on-disk SixtySequences data to a hardware-compatible SD-1 AllSequences SysEx
-/// (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
-/// Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
+/// Convert on-disk SixtySequences data to a lossless library-format AllSequences SysEx payload.
+/// Output: ptr table (240) + 12 lead zeros + packed event data + 60 × 186-byte headers + 29-byte global.
+/// This is the raw payload format, not framed or nibble-encoded; it feeds into allsequences_to_disk.
 /// Caller must call sd1_bytes_free(*out, *out_len).
 #[no_mangle]
 pub extern "C" fn sd1_disk_to_allsequences(
@@ -1086,10 +1089,9 @@ pub extern "C" fn sd1_disk_to_allsequences(
     }
 }
 
-/// Convert on-disk ThirtySequences data to a hardware-compatible SD-1 AllSequences SysEx
-/// (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
-/// Slots 0–29 are populated from disk; slots 30–59 are set to undefined (0xFF headers).
-/// Sequence slot 59 is always undefined in this format (hardware limitation: no ptr-table entry).
+/// Convert on-disk ThirtySequences data to a lossless library-format AllSequences SysEx payload.
+/// Slots 0–29 come from disk; slots 30–59 are set to undefined (0xFF headers).
+/// Output is the raw 60-slot payload (ptr table + event data + headers + global), not framed.
 /// Programs embedded after sequence data (if any) are not included in the output.
 /// Caller must call sd1_bytes_free(*out, *out_len).
 #[no_mangle]
@@ -1102,6 +1104,68 @@ pub extern "C" fn sd1_disk_to_thirty_sequences(
     if disk.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
     let disk_bytes = unsafe { std::slice::from_raw_parts(disk, len) };
     match disk_to_thirty_sequences(disk_bytes) {
+        Ok(data) => {
+            let data_len = data.len();
+            let mut boxed = data.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out = ptr; *out_len = data_len; }
+            SD1_OK
+        }
+        Err(e) => {
+            unsafe { *out = std::ptr::null_mut(); *out_len = 0; }
+            to_error_code(&e)
+        }
+    }
+}
+
+/// Convert on-disk SixtySequences data to a hardware-compatible SD-1 AllSequences SysEx
+/// (F0 0F 05 00 00 0A … F7, nibble-encoded), ready to send to a real SD-1 in load mode.
+/// Sequence slot 59 is always undefined in hardware SysEx format (hardware limitation).
+/// If slot 59 has sequence data and allow_slot59_loss is false, returns SD1_ERR_SLOT59_HAS_DATA.
+/// Caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_disk_to_allsequences_hw_sysex(
+    disk: *const u8,
+    len: usize,
+    has_programs: bool,
+    allow_slot59_loss: bool,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if disk.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    let disk_bytes = unsafe { std::slice::from_raw_parts(disk, len) };
+    match disk_to_allsequences_hw_sysex(disk_bytes, has_programs, allow_slot59_loss) {
+        Ok(data) => {
+            let data_len = data.len();
+            let mut boxed = data.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out = ptr; *out_len = data_len; }
+            SD1_OK
+        }
+        Err(e) => {
+            unsafe { *out = std::ptr::null_mut(); *out_len = 0; }
+            to_error_code(&e)
+        }
+    }
+}
+
+/// Convert on-disk ThirtySequences data to a hardware-compatible SD-1 AllSequences SysEx.
+/// Slots 0–29 from disk; slots 30–59 undefined. Slot 59 hardware limitation applies.
+/// If slot 59 has sequence data and allow_slot59_loss is false, returns SD1_ERR_SLOT59_HAS_DATA.
+/// Caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_disk_to_thirty_sequences_hw_sysex(
+    disk: *const u8,
+    len: usize,
+    allow_slot59_loss: bool,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if disk.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    let disk_bytes = unsafe { std::slice::from_raw_parts(disk, len) };
+    match disk_to_thirty_sequences_hw_sysex(disk_bytes, allow_slot59_loss) {
         Ok(data) => {
             let data_len = data.len();
             let mut boxed = data.into_boxed_slice();

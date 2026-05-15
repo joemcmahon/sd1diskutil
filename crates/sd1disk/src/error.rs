@@ -32,6 +32,8 @@ pub enum Error {
     HfeCrcMismatch { track: u8, side: u8, sector: u8 },
     /// A sector was not found in the HFE track data
     HfeMissingSector { track: u8, side: u8, sector: u8 },
+    /// Sequence slot 59 has data that cannot be encoded in hardware SysEx format
+    Slot59HasData,
     /// I/O error from std
     Io(std::io::Error),
 }
@@ -66,6 +68,7 @@ impl fmt::Display for Error {
             Error::HfeMissingSector { track, side, sector } => write!(
                 f, "HFE missing sector at track {} side {} sector {}", track, side, sector
             ),
+            Error::Slot59HasData => write!(f, "sequence slot 59 has data that cannot be encoded in hardware SysEx format; use allow_slot59_loss=true to proceed"),
             Error::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
