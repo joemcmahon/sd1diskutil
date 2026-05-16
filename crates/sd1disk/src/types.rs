@@ -618,8 +618,8 @@ pub fn disk_to_allsequences_hw_sysex(disk: &[u8], has_programs: bool, allow_slot
     // Build SysEx global.
     let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
     sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
-    let declared = EVENT_LEAD_ZEROS as u32 + sum_ds;
-    sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
+    // global[10:14] = total pool size (verified: MAME 4.syx global[10:14] == pool.len())
+    sysex_global[10..14].copy_from_slice(&(pool.len() as u32).to_be_bytes());
 
     // Build payload.
     let mut payload = Vec::new();
@@ -739,8 +739,8 @@ pub fn disk_to_thirty_sequences_hw_sysex(disk: &[u8], allow_slot59_loss: bool) -
     // Build SysEx global.
     let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
     sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
-    let declared = EVENT_LEAD_ZEROS as u32 + sum_ds;
-    sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
+    // global[10:14] = total pool size (verified: MAME 4.syx global[10:14] == pool.len())
+    sysex_global[10..14].copy_from_slice(&(pool.len() as u32).to_be_bytes());
 
     // Build payload.
     let undefined_hdr = [0xFFu8; SYSEX_HEADER_SIZE];

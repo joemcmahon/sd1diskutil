@@ -1,3 +1,13 @@
+## v1.15 — Fix hardware SysEx global declared-size field
+
+### Bug fixes
+
+- **`disk_to_allsequences_hw_sysex`** / **`disk_to_thirty_sequences_hw_sysex`**: `sysex_global[10..14]` was written as `EVENT_LEAD_ZEROS + sum_ds` instead of the actual pool size. The correct value is `pool.len()` — verified against the MAME `4.syx` hardware dump where `global[10:14] == pool.len()`. The previous formula underreported the pool size when stale pool bytes were present, causing the firmware to miscalculate the event data boundary.
+
+### Testing
+
+- 117 unit/integration tests, all passing (sd1disk: 117, sd1cli: 11, sd1ffi: 30)
+
 ## v1.14 — Fix hardware SysEx header format and stale ds overflow
 
 ### Bug fixes
