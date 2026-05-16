@@ -561,7 +561,10 @@ pub fn disk_to_allsequences_hw_sysex(disk: &[u8], has_programs: bool, allow_slot
     for slot in 0..HEADER_COUNT {
         let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
         if disk_hdr[0] == 0xFF {
-            let sds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
+            let sds = {
+                let raw = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
+                if raw == 0x00FF_FFFF { 0 } else { raw }  // all-0xFF = native Ensoniq undefined
+            };
             if slot < HW_SEQ_COUNT {
                 cumulative_offset[slot] = sum_ds + stale_offset;
                 stale_ds[slot] = sds;
@@ -622,9 +625,13 @@ pub fn disk_to_allsequences_hw_sysex(disk: &[u8], has_programs: bool, allow_slot
     let mut payload = Vec::new();
     payload.extend_from_slice(&ptr_table);
     payload.extend_from_slice(&pool);
+    // Hardware SysEx headers are 186-byte chunks of a sliding window over the
+    // concatenated disk header region starting at byte 112, verified against MAME
+    // hardware dump (SD1-PALETTE, 20/20 defined slots match).
+    const HW_SYSEX_HDR_OFFSET: usize = 112;
     for slot in 0..HW_SEQ_COUNT {
-        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        payload.extend_from_slice(&disk_hdr[..SYSEX_HEADER_SIZE]);
+        let start = HW_SYSEX_HDR_OFFSET + slot * SYSEX_HEADER_SIZE;
+        payload.extend_from_slice(&disk_headers[start..start + SYSEX_HEADER_SIZE]);
     }
     // Seq 59: always undefined in hardware format. Preserve bytes 183..185 from disk
     // for round-trip fidelity (hardware decoder does not stamp slot 59).
@@ -740,10 +747,12 @@ pub fn disk_to_thirty_sequences_hw_sysex(disk: &[u8], allow_slot59_loss: bool) -
     let mut payload = Vec::new();
     payload.extend_from_slice(&ptr_table);
     payload.extend_from_slice(&pool);
-    // Seqs 0..29 from disk
+    // Seqs 0..29: sliding window over disk[112..] in 186-byte chunks.
+    // Window end for slot 29 = 112 + 30*186 = 5692 > disk_headers (5640) but <= disk (>=6144).
+    const HW_SYSEX_HDR_OFFSET: usize = 112;
     for slot in 0..HEADER_COUNT {
-        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        payload.extend_from_slice(&disk_hdr[..SYSEX_HEADER_SIZE]);
+        let start = HW_SYSEX_HDR_OFFSET + slot * SYSEX_HEADER_SIZE;
+        payload.extend_from_slice(&disk[start..start + SYSEX_HEADER_SIZE]);
     }
     // Seqs 30..59: all undefined
     for _ in HEADER_COUNT..HEADER_COUNT_SIXTY {
@@ -2176,5 +2185,80 @@ mod tests {
             .expect("hw_sysex must round-trip");
         // Slot 59 in sixty-seq output must be 0xFF (always undefined for thirty-seq)
         assert_eq!(disk2[59 * 188], 0xFF, "slot 59 must be undefined in thirty_seq hw_sysex output");
+    }
+
+    #[test]
+    fn hw_sysex_headers_match_real_hardware_dump() {
+        // Integration test: only runs if both reference files are present.
+        // Verifies that disk_to_allsequences_hw_sysex produces SysEx headers
+        // byte-for-byte identical to 4.syx (real SD-1 hardware dump of SD1-PALETTE).
+        use crate::image::DiskImage;
+        use crate::directory::{block1_find, SubDirectory, FileType};
+        use crate::fat::FileAllocationTable;
+        use std::path::Path;
+
+        let img_path = "disk_with_everything.img";
+        let syx_path = format!("{}/Downloads/4.syx", std::env::var("HOME").unwrap_or_default());
+        let img = match DiskImage::open(Path::new(img_path)) { Ok(i) => i, Err(_) => return };
+        let raw4 = match std::fs::read(&syx_path) { Ok(b) => b, Err(_) => return };
+
+        // Extract SD1-PALETTE raw disk bytes using FAT chain or contiguous blocks.
+        let (entry, use_contiguous) = (0..4u8)
+            .find_map(|i| SubDirectory::new(i).find(&img, "SD1-PALETTE").map(|e| (e, false)))
+            .or_else(|| block1_find(&img, "SD1-PALETTE").map(|e| (e, true)))
+            .expect("SD1-PALETTE must exist in disk_with_everything.img");
+        let mut palette_bytes = Vec::new();
+        if use_contiguous {
+            let start = entry.first_block as u16;
+            for b in start..start + entry.size_blocks {
+                palette_bytes.extend_from_slice(img.block(b).unwrap());
+            }
+        } else {
+            let chain = FileAllocationTable::chain(&img, entry.first_block as u16).unwrap();
+            for &b in &chain {
+                palette_bytes.extend_from_slice(img.block(b).unwrap());
+            }
+        }
+        // SixtySequences: do NOT truncate — decoders need full block-aligned data.
+
+        // Generate hardware SysEx from disk data.
+        let hw_sysex = disk_to_allsequences_hw_sysex(&palette_bytes, false, false)
+            .expect("SD1-PALETTE must export without error");
+
+        // Nibble-decode our output.
+        const PTR_TABLE_SIZE: usize = 240;
+        const SYSEX_HEADER_SIZE: usize = 186;
+        const SYSEX_HEADERS_TOTAL: usize = 60 * SYSEX_HEADER_SIZE;
+        const SYSEX_GLOBAL_SIZE: usize = 29;
+        let nibble_start = 6usize; // skip F0 0F 05 ch model 0A
+        let f7_pos = hw_sysex.iter().rposition(|&b| b == 0xF7).unwrap();
+        let our_decoded = decode_sysex_nibbles(&hw_sysex[nibble_start..f7_pos]);
+
+        // Nibble-decode 4.syx.
+        let hw_nibble_start = raw4.windows(6)
+            .position(|w| w[0]==0xF0 && w[1]==0x0F && w[2]==0x05 && w[5]==0x0A)
+            .unwrap() + 6;
+        let hw_f7 = raw4[hw_nibble_start..].iter().position(|&b| b==0xF7).unwrap();
+        let hw_decoded = decode_sysex_nibbles(&raw4[hw_nibble_start..hw_nibble_start+hw_f7]);
+
+        // Locate header regions in both decoded payloads.
+        let our_pool = our_decoded.len() - PTR_TABLE_SIZE - SYSEX_HEADERS_TOTAL - SYSEX_GLOBAL_SIZE;
+        let hw_pool  = hw_decoded.len()  - PTR_TABLE_SIZE - SYSEX_HEADERS_TOTAL - SYSEX_GLOBAL_SIZE;
+        let our_hdr_start = PTR_TABLE_SIZE + our_pool;
+        let hw_hdr_start  = PTR_TABLE_SIZE + hw_pool;
+
+        // Compare headers for every slot that 4.syx defines (byte0 != 0xFF).
+        let mut matches = 0usize;
+        let mut mismatches = 0usize;
+        for slot in 0..59usize {
+            if hw_decoded[hw_hdr_start + slot * SYSEX_HEADER_SIZE] == 0xFF { continue; }
+            let our_hdr = &our_decoded[our_hdr_start + slot*SYSEX_HEADER_SIZE..
+                                       our_hdr_start + (slot+1)*SYSEX_HEADER_SIZE];
+            let hw_hdr  = &hw_decoded[hw_hdr_start  + slot*SYSEX_HEADER_SIZE..
+                                      hw_hdr_start  + (slot+1)*SYSEX_HEADER_SIZE];
+            if our_hdr == hw_hdr { matches += 1; } else { mismatches += 1; }
+        }
+        assert_eq!(mismatches, 0,
+            "{} header(s) matched, {} mismatched vs 4.syx hardware dump", matches, mismatches);
     }
 }

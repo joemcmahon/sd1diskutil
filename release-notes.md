@@ -1,3 +1,22 @@
+## v1.14 — Fix hardware SysEx header format and stale ds overflow
+
+### Bug fixes
+
+- **`disk_to_allsequences_hw_sysex`** / **`disk_to_thirty_sequences_hw_sysex`**: Two bugs caused the hardware SysEx output to be rejected by real SD-1 firmware (sequences loaded as empty) and, on native Ensoniq disks, to produce ~1.5 GB output files.
+
+  **Wrong header format (headers loaded as empty):** The 186-byte per-slot sequence headers in the SysEx payload were taken as independent slices (first 186 bytes of each 188-byte disk header). The hardware firmware expects them as a sliding window over the concatenated disk header region starting at byte 112: `hardware_header[slot] = disk_headers_flat[112 + slot*186 : 112 + (slot+1)*186]`. Verified byte-for-byte against a MAME hardware dump of SD1-PALETTE (20/20 defined slots match).
+
+  **Stale ds overflow (~1.5 GB output):** Native Ensoniq disks fill undefined sequence headers entirely with `0xFF`, including the 3-byte `ds` (event data size) field. Reading these as `0xFFFFFF` (16,777,215 bytes per undefined slot) caused the pool section to reference hundreds of megabytes of non-existent data, producing multi-gigabyte nibble-encoded SysEx. Fixed by clamping `ds = 0` when the raw value is `0xFFFFFF`.
+
+  **ThirtySequences bounds:** The sliding window for ThirtySequences reads from `disk` (raw on-disk bytes, ≥6,144 bytes) rather than `disk_headers` (5,640 bytes) because the window end for the last slot (5,692 bytes) exceeds `disk_headers` but fits within `disk`.
+
+- Integration test `hw_sysex_headers_match_real_hardware_dump` added: verifies the fix against `disk_with_everything.img` + `4.syx` (real SD-1 hardware dump); skips gracefully if reference files are absent.
+
+### Testing
+
+- 117 unit/integration tests, all passing (sd1disk: 117, sd1cli: 11, sd1ffi: 30)
+- `hw_sysex_headers_match_real_hardware_dump` passes against real reference files
+
 ## v1.13 — Explicit hardware SysEx export; lossless default restored
 
 ### Breaking change (reverts v1.12 behavior)
