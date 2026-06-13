@@ -240,11 +240,15 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
         return Err(Error::InvalidSysEx("AllSequences payload: event data section too short"));
     }
 
-    // SysEx global[10..14] (BE u32) = declared event-area size = EVENT_LEAD_ZEROS + packed_events.
-    let declared_size = u32::from_be_bytes([
-        sysex_global[10], sysex_global[11], sysex_global[12], sysex_global[13],
-    ]);
-    let seq_data_len = (declared_size as usize).saturating_sub(EVENT_LEAD_ZEROS);
+    // Total event bytes from the per-slot ds values in the headers (robust against
+    // differing "declared size" conventions in the global section).
+    let seq_data_len: usize = (0..HEADER_COUNT)
+        .filter_map(|slot| {
+            let hdr = &headers_sec[slot * SYSEX_HEADER_SIZE..(slot + 1) * SYSEX_HEADER_SIZE];
+            if hdr[0] == 0xFF { return None; }
+            Some(u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]) as usize)
+        })
+        .sum();
 
     let event_start = EVENT_LEAD_ZEROS;
     if event_data.len() < event_start + seq_data_len {
@@ -281,8 +285,12 @@ pub fn allsequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u8]>)
     }
 
     // Write global: on-disk global = SysEx global[8..29] (strip 8 SD-1-internal bytes).
+    // The on-disk declared field (global[2..6]) uses the genuine SD-1 convention:
+    // 252 + sum of all sequence data sizes (verified against the factory disk).
     let disk_global = &sysex_global[GLOBAL_INTERNAL_BYTES..];
     out[DISK_GLOBAL_START..DISK_GLOBAL_END].copy_from_slice(disk_global);
+    out[DISK_GLOBAL_START + 2..DISK_GLOBAL_START + 6]
+        .copy_from_slice(&(252u32 + seq_data_len as u32).to_be_bytes());
 
     if let Some(progs) = interleaved_programs {
         out[PROGRAMS_DISK_OFFSET..PROGRAMS_DISK_OFFSET + PROGRAMS_SIZE].copy_from_slice(progs);
@@ -494,6 +502,102 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardware AllSequences SysEx format
+//
+// Verified byte-for-byte against a genuine SD-1 AllSequences dump of the
+// factory "SD1-PALETTE" file (the only differences are machine-state bytes:
+// the MIDI channel in the frame header, and the "current selected sequence" /
+// one state flag inside the global section).
+//
+// Decoded (de-nibblized) payload layout:
+//   [0..240]       ptr table, 60 × u32 BE:
+//                    entry 0      = base RAM address (0x00049000)
+//                    entry 1      = 21 (constant, 0x15)
+//                    entry k+2    = payload-absolute offset of slot k's event
+//                                   data = 252 + Σ ds of defined slots < k,
+//                                   for k = 0..57; 0 for undefined slots.
+//                    Slots 58 and 59 have NO ptr entries (hardware limit).
+//   [240..252]     12 zero bytes
+//   [252..252+N]   packed event data in slot order, N = Σ ds
+//   [..+128]       trailer: u32 = offset of global relative to trailer start
+//                  (128 + 60×188 = 11408 = 0x2C90), u32 = 0xFFFFD1E0
+//                  (machine constant), then 60 × u16 BE header offsets
+//                  relative to trailer start (128 + 188·k).
+//   [..+11280]     60 × 188-byte sequence headers, BYTE-IDENTICAL to on-disk
+//                  (including header bytes 186..188).
+//   [..+21]        21-byte global, byte-identical to on-disk; declared size at
+//                  global[2..6] = 252 + Σ ds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HW_DISK_HEADER_SIZE: usize = 188;
+const HW_HEADER_COUNT: usize = 60;
+const HW_HEADERS_TOTAL: usize = HW_DISK_HEADER_SIZE * HW_HEADER_COUNT; // 11280
+const HW_GLOBAL_SIZE: usize = 21;
+const HW_TRAILER_SIZE: usize = 128;
+const HW_EVENT_LEAD_ZEROS: usize = 12;
+const HW_EVENT_START: u32 = 252; // 240-byte ptr table + 12 lead zeros
+const HW_BASE_ADDRESS: u32 = 0x0004_9000;
+const HW_PTR1_CONSTANT: u32 = 21;
+const HW_TRAILER_CONSTANT: u32 = 0xFFFF_D1E0;
+const HW_BLOCK_SIZE: usize = 512;
+
+/// Build the genuine hardware AllSequences SysEx (F0…F7, nibble-encoded) from
+/// a 60 × 188-byte header region, a 21-byte global and per-slot event data.
+///
+/// `ds[k]` must be the event-data size of slot k (0 for undefined/dropped
+/// slots) and `packed_events` the concatenation of all slots' event data in
+/// slot order.
+fn build_hw_allsequences_sysex(
+    headers: &[u8],        // 60 × 188 bytes, on-disk format
+    disk_global: &[u8],    // 21 bytes, on-disk format
+    packed_events: &[u8],
+    ds: &[u32; HW_HEADER_COUNT],
+) -> Vec<u8> {
+    debug_assert_eq!(headers.len(), HW_HEADERS_TOTAL);
+    debug_assert_eq!(disk_global.len(), HW_GLOBAL_SIZE);
+
+    let sum_ds: u32 = ds.iter().sum();
+    debug_assert_eq!(packed_events.len(), sum_ds as usize);
+
+    // Ptr table.
+    let mut ptr_table = vec![0u8; 240];
+    ptr_table[0..4].copy_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
+    ptr_table[4..8].copy_from_slice(&HW_PTR1_CONSTANT.to_be_bytes());
+    let mut cum: u32 = 0;
+    for slot in 0..58usize {
+        let defined = headers[slot * HW_DISK_HEADER_SIZE] != 0xFF;
+        let v = if defined && ds[slot] > 0 { HW_EVENT_START + cum } else { 0 };
+        ptr_table[(slot + 2) * 4..(slot + 3) * 4].copy_from_slice(&v.to_be_bytes());
+        cum += ds[slot];
+    }
+
+    // Trailer.
+    let mut trailer = Vec::with_capacity(HW_TRAILER_SIZE);
+    trailer.extend_from_slice(&((HW_TRAILER_SIZE + HW_HEADERS_TOTAL) as u32).to_be_bytes());
+    trailer.extend_from_slice(&HW_TRAILER_CONSTANT.to_be_bytes());
+    for k in 0..HW_HEADER_COUNT as u16 {
+        trailer.extend_from_slice(&(HW_TRAILER_SIZE as u16 + HW_DISK_HEADER_SIZE as u16 * k).to_be_bytes());
+    }
+
+    // Global: verbatim, with declared end offset recomputed as 252 + Σ ds.
+    let mut global = [0u8; HW_GLOBAL_SIZE];
+    global.copy_from_slice(disk_global);
+    global[2..6].copy_from_slice(&(HW_EVENT_START + sum_ds).to_be_bytes());
+
+    let mut payload = Vec::with_capacity(
+        240 + HW_EVENT_LEAD_ZEROS + packed_events.len() + HW_TRAILER_SIZE + HW_HEADERS_TOTAL + HW_GLOBAL_SIZE,
+    );
+    payload.extend_from_slice(&ptr_table);
+    payload.extend_from_slice(&[0u8; HW_EVENT_LEAD_ZEROS]);
+    payload.extend_from_slice(packed_events);
+    payload.extend_from_slice(&trailer);
+    payload.extend_from_slice(headers);
+    payload.extend_from_slice(&global);
+
+    sysex_nibble_encode_wrap(&payload)
+}
+
 /// Reconstruct a hardware-compatible SD-1 AllSequences SysEx (F0…F7, nibble-encoded)
 /// from the SD-1 on-disk SixtySequences format, ready to send to a real SD-1 in load mode.
 ///
@@ -506,145 +610,74 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
 /// On-disk layout (with embedded programs, `has_programs = true`):
 ///   same header/global prefix, seq data starts at 44032 instead of 11776.
 ///
-/// Sequence slot 59 is always undefined in hardware SysEx format (hardware limitation:
-/// no ptr-table entry). If slot 59 has real data on disk and `allow_slot59_loss` is false,
-/// returns `Err(Error::Slot59HasData)`. If `allow_slot59_loss` is true, slot 59 is silently
-/// mapped to undefined (0xFF) in the output.
+/// Sequence slots 58 and 59 cannot be represented in the hardware SysEx format
+/// (the 60-entry pointer table holds two reserved entries plus slots 0–57).
+/// If slot 58 or 59 has real data on disk and `allow_slot59_loss` is false,
+/// returns `Err(Error::Slot59HasData)`. If `allow_slot59_loss` is true, those
+/// slots are mapped to undefined (0xFF) in the output and their data is dropped.
 pub fn disk_to_allsequences_hw_sysex(disk: &[u8], has_programs: bool, allow_slot59_loss: bool) -> Result<Vec<u8>> {
-    const DISK_HEADER_SIZE: usize = 188;
-    const SYSEX_HEADER_SIZE: usize = 186;
-    const HEADER_COUNT: usize = 60;
-    const HW_SEQ_COUNT: usize = 59;
-    const HW_POOL_STATE_BYTES: usize = 9;
-    const EVENT_LEAD_ZEROS: usize = 12;
-    const POOL_PREAMBLE: usize = EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES; // 21
-    const HW_BASE_ADDRESS: u32 = 0x0004_9000;
-    const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT; // 11280
-    const DISK_GLOBAL_SIZE: usize = 21;
-    const SYSEX_GLOBAL_SIZE: usize = 29;
-    const GLOBAL_INTERNAL_BYTES: usize = 8;
-    const DISK_GLOBAL_START: usize = DISK_HEADERS_TOTAL;                  // 11280
-    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + DISK_GLOBAL_SIZE;  // 11301
+    const DISK_GLOBAL_START: usize = HW_HEADERS_TOTAL;                       // 11280
+    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + HW_GLOBAL_SIZE;       // 11301
     const SEQ_DATA_NO_PROGRAMS: usize = 11776;
     const SEQ_DATA_WITH_PROGRAMS: usize = 44032;
-    const BLOCK_SIZE: usize = 512;
-    const PTR_TABLE_SIZE: usize = 240;
 
     let min_size = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
     if disk.len() < min_size {
         return Err(Error::InvalidSysEx("on-disk SixtySequences data too short"));
     }
 
-    let disk_headers = &disk[..DISK_HEADERS_TOTAL];
+    let disk_headers = &disk[..HW_HEADERS_TOTAL];
     let disk_global = &disk[DISK_GLOBAL_START..DISK_GLOBAL_END];
     let seq_data_offset = if has_programs { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
 
-    // Check slot 59 for data before proceeding.
-    let disk_hdr59 = &disk_headers[59 * DISK_HEADER_SIZE..(59 + 1) * DISK_HEADER_SIZE];
-    let ds59 = u32::from_be_bytes([0, disk_hdr59[183], disk_hdr59[184], disk_hdr59[185]]);
-    if disk_hdr59[0] != 0xFF && ds59 > 0 {
-        if !allow_slot59_loss {
-            return Err(Error::Slot59HasData);
+    // Slots 58 and 59 have no ptr-table entries in the hardware format.
+    let mut dropped = [false; HW_HEADER_COUNT];
+    for slot in [58usize, 59usize] {
+        let hdr = &disk_headers[slot * HW_DISK_HEADER_SIZE..(slot + 1) * HW_DISK_HEADER_SIZE];
+        let dsv = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
+        if hdr[0] != 0xFF && dsv > 0 {
+            if !allow_slot59_loss {
+                return Err(Error::Slot59HasData);
+            }
+            dropped[slot] = true;
         }
     }
 
-    // Pass 1: unpack real event data for defined seqs 0..58 (seq 59 has no HW ptr entry).
-    // Also read stale ds from disk bytes 183..185 for undefined (0xFF) seqs 0..58
-    // so their stale ptr-table entries can be reconstructed for a lossless round-trip.
+    // Collect per-slot ds and packed event data (slot order, block padding removed).
+    let mut ds = [0u32; HW_HEADER_COUNT];
     let mut packed_events: Vec<u8> = Vec::new();
-    let mut stale_ds = [0u32; HW_SEQ_COUNT];
-    let mut real_offset: u32 = 0;
-    let mut stale_offset: u32 = 0;
-    let mut cumulative_offset = [0u32; HW_SEQ_COUNT];
     let mut in_pos = seq_data_offset;
-    let mut sum_ds: u32 = 0;
-    for slot in 0..HEADER_COUNT {
-        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        if disk_hdr[0] == 0xFF {
-            let sds = {
-                let raw = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
-                if raw == 0x00FF_FFFF { 0 } else { raw }  // all-0xFF = native Ensoniq undefined
-            };
-            if slot < HW_SEQ_COUNT {
-                cumulative_offset[slot] = sum_ds + stale_offset;
-                stale_ds[slot] = sds;
-                stale_offset += sds;
-            }
-            continue;
-        }
-        let ds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
-        if slot < HW_SEQ_COUNT {
-            cumulative_offset[slot] = real_offset;
-        }
-        if ds == 0 { continue; }
-        if in_pos + ds as usize > disk.len() {
+    for slot in 0..HW_HEADER_COUNT {
+        let hdr = &disk_headers[slot * HW_DISK_HEADER_SIZE..(slot + 1) * HW_DISK_HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let dsv = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
+        if dsv == 0 { continue; }
+        if in_pos + dsv as usize > disk.len() {
             return Err(Error::InvalidSysEx("on-disk SixtySequences: sequence data out of bounds"));
         }
-        if slot < HW_SEQ_COUNT {
-            packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
-            real_offset += ds;
-            sum_ds += ds;
+        if !dropped[slot] {
+            ds[slot] = dsv;
+            packed_events.extend_from_slice(&disk[in_pos..in_pos + dsv as usize]);
         }
-        in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        in_pos += (dsv as usize + HW_BLOCK_SIZE - 1) / HW_BLOCK_SIZE * HW_BLOCK_SIZE;
     }
 
-    // Build HW ptr table.
-    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
-    ptr_table[0..4].copy_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
-    for slot in 0..HW_SEQ_COUNT {
-        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        let hw_val: u32;
-        if disk_hdr[0] != 0xFF {
-            let ds_from_disk = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
-            if ds_from_disk == 0 && slot > 0 {
-                hw_val = 0;
-            } else {
-                hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
+    // Headers go out verbatim; dropped slots are stamped undefined.
+    if dropped.iter().any(|&d| d) {
+        let mut headers = disk_headers.to_vec();
+        for slot in 0..HW_HEADER_COUNT {
+            if dropped[slot] {
+                let base = slot * HW_DISK_HEADER_SIZE;
+                headers[base] = 0xFF;
+                headers[base + 183] = 0;
+                headers[base + 184] = 0;
+                headers[base + 185] = 0;
             }
-        } else {
-            hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
         }
-        ptr_table[(slot + 1) * 4..(slot + 2) * 4].copy_from_slice(&hw_val.to_be_bytes());
+        Ok(build_hw_allsequences_sysex(&headers, disk_global, &packed_events, &ds))
+    } else {
+        Ok(build_hw_allsequences_sysex(disk_headers, disk_global, &packed_events, &ds))
     }
-
-    // Build HW pool.
-    let mut pool: Vec<u8> = Vec::new();
-    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-    pool.extend_from_slice(&[0u8; HW_POOL_STATE_BYTES]);
-    pool.extend_from_slice(&packed_events);
-    pool.extend(std::iter::repeat(0u8).take(stale_offset as usize));
-    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-
-    // Build SysEx global.
-    let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
-    sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
-    // global[10:14] = total pool size (verified: MAME 4.syx global[10:14] == pool.len())
-    sysex_global[10..14].copy_from_slice(&(pool.len() as u32).to_be_bytes());
-
-    // Build payload.
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&ptr_table);
-    payload.extend_from_slice(&pool);
-    // Hardware SysEx headers are 186-byte chunks of a sliding window over the
-    // concatenated disk header region starting at byte 112, verified against MAME
-    // hardware dump (SD1-PALETTE, 20/20 defined slots match).
-    const HW_SYSEX_HDR_OFFSET: usize = 112;
-    for slot in 0..HW_SEQ_COUNT {
-        let start = HW_SYSEX_HDR_OFFSET + slot * SYSEX_HEADER_SIZE;
-        payload.extend_from_slice(&disk_headers[start..start + SYSEX_HEADER_SIZE]);
-    }
-    // Seq 59: always undefined in hardware format. Preserve bytes 183..185 from disk
-    // for round-trip fidelity (hardware decoder does not stamp slot 59).
-    {
-        let mut hdr59 = [0xFFu8; SYSEX_HEADER_SIZE];
-        hdr59[183] = disk_hdr59[183];
-        hdr59[184] = disk_hdr59[184];
-        hdr59[185] = disk_hdr59[185];
-        payload.extend_from_slice(&hdr59);
-    }
-    payload.extend_from_slice(&sysex_global);
-
-    Ok(sysex_nibble_encode_wrap(&payload))
 }
 
 /// Reconstruct a hardware-compatible SD-1 AllSequences SysEx (F0…F7, nibble-encoded)
@@ -657,111 +690,54 @@ pub fn disk_to_allsequences_hw_sysex(disk: &[u8], has_programs: bool, allow_slot
 ///   [6144..]     – sequence event data (each sequence block-padded to 512 bytes)
 ///                  Programs (if any) appear after the sequence data and are ignored here.
 ///
-/// Slots 0–29 come from disk; slots 30–59 are set to undefined (0xFF headers).
-/// Sequence slot 59 is always undefined in hardware SysEx format (hardware limitation).
-/// The `allow_slot59_loss` parameter is present for API symmetry but slot 59 is always
-/// undefined in ThirtySequences disk format; the check succeeds unless disk is corrupted.
+/// Slots 0–29 come from disk; slots 30–59 are synthesized as undefined (0xFF)
+/// headers. ThirtySequences disks structurally cannot have data in slots 58/59,
+/// so `allow_slot59_loss` never triggers; it is kept for API symmetry.
 pub fn disk_to_thirty_sequences_hw_sysex(disk: &[u8], allow_slot59_loss: bool) -> Result<Vec<u8>> {
-    const DISK_HEADER_SIZE: usize = 188;
-    const SYSEX_HEADER_SIZE: usize = 186;
-    const HEADER_COUNT: usize = 30;
-    const HW_SEQ_COUNT: usize = 59;
-    const HEADER_COUNT_SIXTY: usize = 60;
-    const HW_POOL_STATE_BYTES: usize = 9;
-    const EVENT_LEAD_ZEROS: usize = 12;
-    const POOL_PREAMBLE: usize = EVENT_LEAD_ZEROS + HW_POOL_STATE_BYTES; // 21
-    const HW_BASE_ADDRESS: u32 = 0x0004_9000;
-    const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT; // 5640
-    const DISK_GLOBAL_SIZE: usize = 21;
-    const SYSEX_GLOBAL_SIZE: usize = 29;
-    const GLOBAL_INTERNAL_BYTES: usize = 8;
-    const DISK_GLOBAL_START: usize = DISK_HEADERS_TOTAL;                    // 5640
-    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + DISK_GLOBAL_SIZE;    // 5661
+    const HEADER_COUNT_THIRTY: usize = 30;
+    const DISK_HEADERS_TOTAL_THIRTY: usize = HW_DISK_HEADER_SIZE * HEADER_COUNT_THIRTY; // 5640
+    const DISK_GLOBAL_START: usize = DISK_HEADERS_TOTAL_THIRTY;                          // 5640
+    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + HW_GLOBAL_SIZE;                   // 5661
     const SEQ_DATA_OFFSET: usize = 6144;
-    const BLOCK_SIZE: usize = 512;
-    const PTR_TABLE_SIZE: usize = 240;
+
+    let _ = allow_slot59_loss; // slots 58/59 are structurally absent on ThirtySequences disks
 
     if disk.len() < SEQ_DATA_OFFSET {
         return Err(Error::InvalidSysEx("on-disk ThirtySequences data too short"));
     }
 
-    let disk_headers = &disk[..DISK_HEADERS_TOTAL];
-    let disk_global  = &disk[DISK_GLOBAL_START..DISK_GLOBAL_END];
+    let disk_global = &disk[DISK_GLOBAL_START..DISK_GLOBAL_END];
 
-    // ThirtySequences has no slot 59 on disk (only 30 slots). Slot 59 in the
-    // synthesized 60-slot output is always undefined. Check for the (degenerate)
-    // case where a ThirtySequences disk somehow has data at slot-59 position.
-    // In practice this never happens, but honour the contract for API symmetry.
-    // (ThirtySequences disk only has 30 headers, so slot 59 is always absent.)
-    // No Slot59HasData check needed here — slot 59 is structurally absent.
-    let _ = allow_slot59_loss; // parameter reserved for API symmetry
+    // Synthesize a 60-slot header region: slots 0–29 verbatim, 30–59 undefined.
+    let mut headers = vec![0xFFu8; HW_HEADERS_TOTAL];
+    headers[..DISK_HEADERS_TOTAL_THIRTY].copy_from_slice(&disk[..DISK_HEADERS_TOTAL_THIRTY]);
+    for slot in HEADER_COUNT_THIRTY..HW_HEADER_COUNT {
+        let base = slot * HW_DISK_HEADER_SIZE;
+        headers[base + 183] = 0;
+        headers[base + 184] = 0;
+        headers[base + 185] = 0;
+    }
 
-    // Unpack per-sequence event data for the 30 on-disk slots, removing block padding.
+    // Collect per-slot ds and packed event data for slots 0–29.
+    let mut ds = [0u32; HW_HEADER_COUNT];
     let mut packed_events: Vec<u8> = Vec::new();
-    let mut cumulative_offset = [0u32; HW_SEQ_COUNT];
-    let mut offset: u32 = 0;
     let mut in_pos = SEQ_DATA_OFFSET;
-    let mut sum_ds: u32 = 0;
-    for slot in 0..HEADER_COUNT {
-        cumulative_offset[slot] = offset;
-        let disk_hdr = &disk_headers[slot * DISK_HEADER_SIZE..(slot + 1) * DISK_HEADER_SIZE];
-        if disk_hdr[0] == 0xFF { continue; }
-        let ds = u32::from_be_bytes([0, disk_hdr[183], disk_hdr[184], disk_hdr[185]]);
-        if ds == 0 { continue; }
-        if in_pos + ds as usize > disk.len() {
+    for slot in 0..HEADER_COUNT_THIRTY {
+        let hdr = &headers[slot * HW_DISK_HEADER_SIZE..(slot + 1) * HW_DISK_HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        let dsv = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
+        if dsv == 0 { continue; }
+        if in_pos + dsv as usize > disk.len() {
             return Err(Error::InvalidSysEx("on-disk ThirtySequences: sequence data out of bounds"));
         }
-        packed_events.extend_from_slice(&disk[in_pos..in_pos + ds as usize]);
-        in_pos += (ds as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-        offset += ds;
-        sum_ds += ds;
-    }
-    // Seqs 30..58: undefined (0xFF headers), ptr entries point past event data.
-    for slot in HEADER_COUNT..HW_SEQ_COUNT {
-        cumulative_offset[slot] = offset;
+        ds[slot] = dsv;
+        packed_events.extend_from_slice(&disk[in_pos..in_pos + dsv as usize]);
+        in_pos += (dsv as usize + HW_BLOCK_SIZE - 1) / HW_BLOCK_SIZE * HW_BLOCK_SIZE;
     }
 
-    // Build HW ptr table.
-    let mut ptr_table = vec![0u8; PTR_TABLE_SIZE];
-    ptr_table[0..4].copy_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
-    for slot in 0..HW_SEQ_COUNT {
-        let hw_val = POOL_PREAMBLE as u32 + cumulative_offset[slot];
-        ptr_table[(slot + 1) * 4..(slot + 2) * 4].copy_from_slice(&hw_val.to_be_bytes());
-    }
-
-    // Build HW pool.
-    let mut pool: Vec<u8> = Vec::new();
-    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-    pool.extend_from_slice(&[0u8; HW_POOL_STATE_BYTES]);
-    pool.extend_from_slice(&packed_events);
-    pool.extend_from_slice(&[0u8; EVENT_LEAD_ZEROS]);
-
-    // Build SysEx global.
-    let mut sysex_global = [0u8; SYSEX_GLOBAL_SIZE];
-    sysex_global[GLOBAL_INTERNAL_BYTES..].copy_from_slice(disk_global);
-    // global[10:14] = total pool size (verified: MAME 4.syx global[10:14] == pool.len())
-    sysex_global[10..14].copy_from_slice(&(pool.len() as u32).to_be_bytes());
-
-    // Build payload.
-    let undefined_hdr = [0xFFu8; SYSEX_HEADER_SIZE];
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&ptr_table);
-    payload.extend_from_slice(&pool);
-    // Seqs 0..29: sliding window over disk[112..] in 186-byte chunks.
-    // Window end for slot 29 = 112 + 30*186 = 5692 > disk_headers (5640) but <= disk (>=6144).
-    const HW_SYSEX_HDR_OFFSET: usize = 112;
-    for slot in 0..HEADER_COUNT {
-        let start = HW_SYSEX_HDR_OFFSET + slot * SYSEX_HEADER_SIZE;
-        payload.extend_from_slice(&disk[start..start + SYSEX_HEADER_SIZE]);
-    }
-    // Seqs 30..59: all undefined
-    for _ in HEADER_COUNT..HEADER_COUNT_SIXTY {
-        payload.extend_from_slice(&undefined_hdr);
-    }
-    payload.extend_from_slice(&sysex_global);
-
-    Ok(sysex_nibble_encode_wrap(&payload))
+    Ok(build_hw_allsequences_sysex(&headers, disk_global, &packed_events, &ds))
 }
+
 
 /// Convert an AllSequences SysEx payload to the SD-1 on-disk ThirtySequences format.
 ///
@@ -959,37 +935,28 @@ fn sysex_nibble_encode_wrap(payload: &[u8]) -> Vec<u8> {
 /// Multi-message files (e.g. from SysEx Librarian) are supported; the first
 /// AllSequences (0x0A) message found is processed.
 ///
-/// Hardware decoded payload layout:
-///   `[0..4]`       – base RAM address (machine-specific; discarded)
-///   `[4..240]`     – 59 × 4-byte BE pool offsets for seqs 0–58 (relative to pool start)
-///   `[240..240+P]` – event pool: 12 lead zeros + 9-byte HW state + packed seq data (P bytes total)
-///   `[240+P..]`    – 60 × 186-byte sequence headers then 29-byte global section
+/// Hardware decoded payload layout (see `build_hw_allsequences_sysex`):
+///   `[0..240]`    – ptr table: base RAM address, constant 21, then payload-absolute
+///                   event offsets for slots 0–57 (entries k+2); 0 = undefined.
+///   `[240..252]`  – 12 zero bytes
+///   `[252..252+N]`– packed event data in slot order (N = Σ ds)
+///   `[..+128]`    – trailer (header offset table; informational)
+///   `[..+11280]`  – 60 × 188-byte sequence headers (on-disk format, verbatim)
+///   `[..+21]`     – 21-byte global section (on-disk format)
 ///
-/// Seq 59 has no ptr-table entry and is always treated as undefined.
+/// Slots 58 and 59 have no ptr-table entries; if their headers are defined the
+/// event data is located by cumulative offset.
 ///
 /// Output is the same on-disk SixtySequences layout produced by `allsequences_to_disk`.
 /// `interleaved_programs`, if provided, must be exactly 60 × 530 = 31800 bytes.
 pub fn allsequences_hardware_sysex_to_disk(raw: &[u8], interleaved_programs: Option<&[u8]>) -> Result<Vec<u8>> {
-    const PTR_TABLE_SIZE: usize = 240;
-    const SYSEX_HEADER_SIZE: usize = 186;
-    const DISK_HEADER_SIZE: usize = 188;
-    const HEADER_COUNT: usize = 60;
-    const SYSEX_GLOBAL_SIZE: usize = 29;
-    const DISK_GLOBAL_SIZE: usize = 21;
-    const GLOBAL_INTERNAL_BYTES: usize = 8;
-    const SYSEX_HEADERS_TOTAL: usize = SYSEX_HEADER_SIZE * HEADER_COUNT; // 11160
-    const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT;   // 11280
-    const DISK_GLOBAL_START: usize = DISK_HEADERS_TOTAL;                  // 11280
-    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + DISK_GLOBAL_SIZE;  // 11301
-    const EVENT_LEAD_ZEROS: usize = 12;
-    const POOL_PREAMBLE: usize = 21; // 12 lead zeros + 9 HW state bytes
-    const BLOCK_SIZE: usize = 512;
     const PROGRAMS_DISK_OFFSET: usize = 11776;
     const PROGRAMS_SIZE: usize = 60 * 530;    // 31800
     const SEQ_DATA_WITH_PROGRAMS: usize = 44032;
     const SEQ_DATA_NO_PROGRAMS: usize = 11776;
-    // minimum: ptr table + preamble + 1 header + global
-    const MIN_DECODED: usize = PTR_TABLE_SIZE + POOL_PREAMBLE + SYSEX_HEADERS_TOTAL + SYSEX_GLOBAL_SIZE;
+    const DISK_GLOBAL_START: usize = HW_HEADERS_TOTAL;                   // 11280
+    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + HW_GLOBAL_SIZE;   // 11301
+    const MIN_DECODED: usize = 240 + HW_EVENT_LEAD_ZEROS + HW_TRAILER_SIZE + HW_HEADERS_TOTAL + HW_GLOBAL_SIZE;
 
     if let Some(progs) = interleaved_programs {
         if progs.len() != PROGRAMS_SIZE {
@@ -1011,111 +978,83 @@ pub fn allsequences_hardware_sysex_to_disk(raw: &[u8], interleaved_programs: Opt
         return Err(Error::InvalidSysEx("hardware AllSequences: payload too short after nibble decode"));
     }
 
-    // Pool occupies decoded[PTR_TABLE_SIZE..PTR_TABLE_SIZE+pool_size].
-    // pool_size includes the 12 lead zeros at pool[0..12]; total_packed excludes them.
-    let pool_size = decoded.len() - PTR_TABLE_SIZE - SYSEX_HEADERS_TOTAL - SYSEX_GLOBAL_SIZE;
-    if pool_size < POOL_PREAMBLE {
-        return Err(Error::InvalidSysEx("hardware AllSequences: event pool too small"));
-    }
-    let total_packed = pool_size.saturating_sub(EVENT_LEAD_ZEROS) as u32;
-    let pool = &decoded[PTR_TABLE_SIZE..PTR_TABLE_SIZE + pool_size];
-    let sysex_headers_start = PTR_TABLE_SIZE + pool_size;
-    let sysex_global_start = sysex_headers_start + SYSEX_HEADERS_TOTAL;
+    // Headers and global sit at the end of the payload.
+    let global_start = decoded.len() - HW_GLOBAL_SIZE;
+    let headers_start = global_start - HW_HEADERS_TOTAL;
+    let trailer_start = headers_start - HW_TRAILER_SIZE; // event data must end here
+    let sysex_headers = &decoded[headers_start..global_start];
+    let sysex_global = &decoded[global_start..];
 
-    // decoded[0..4] = base RAM address (discard).
-    // decoded[4..240] = 59 pool offsets for seqs 0..58 (relative to pool[0]).
-    let mut seq_offsets = [0u32; 59];
-    for i in 0..59usize {
-        let o = 4 + i * 4;
-        seq_offsets[i] = u32::from_be_bytes([decoded[o], decoded[o+1], decoded[o+2], decoded[o+3]]);
+    // Per-slot ds from the headers (the headers are authoritative).
+    let mut ds = [0u32; HW_HEADER_COUNT];
+    for slot in 0..HW_HEADER_COUNT {
+        let hdr = &sysex_headers[slot * HW_DISK_HEADER_SIZE..(slot + 1) * HW_DISK_HEADER_SIZE];
+        if hdr[0] == 0xFF { continue; }
+        ds[slot] = u32::from_be_bytes([0, hdr[183], hdr[184], hdr[185]]);
     }
+    let sum_ds: u32 = ds.iter().sum();
 
-    // Compute ds[i] for seqs 0..58 from ptr-table differences.
-    // ds[59] = 0 (no ptr-table entry; always undefined in hardware format).
-    let mut ds = [0u32; HEADER_COUNT];
-    for i in 0..59usize {
-        if seq_offsets[i] == 0 && i > 0 {
-            ds[i] = 0;
-            continue;
-        }
-        let next = (i + 1..59)
-            .find(|&j| seq_offsets[j] > 0)
-            .map(|j| seq_offsets[j])
-            .unwrap_or(total_packed);
-        ds[i] = next.saturating_sub(seq_offsets[i]);
+    // Event source offsets: prefer the ptr-table entry (entry k+2, payload-absolute);
+    // fall back to the cumulative offset for missing/zero entries (slots 58/59 and
+    // dumps with zeroed entries). The pool can be fragmented on real hardware after
+    // deletions, which is exactly what the ptr table encodes.
+    let mut src_offset = [0u32; HW_HEADER_COUNT];
+    let mut cum: u32 = 0;
+    for slot in 0..HW_HEADER_COUNT {
+        let table_entry = if slot < 58 {
+            let o = (slot + 2) * 4;
+            u32::from_be_bytes([decoded[o], decoded[o + 1], decoded[o + 2], decoded[o + 3]])
+        } else {
+            0
+        };
+        src_offset[slot] = if table_entry != 0 { table_entry } else { HW_EVENT_START + cum };
+        cum += ds[slot];
     }
-
-    // Only count sequences that are actually written (non-0xFF header).
-    // Hardware ptr tables can have stale non-zero entries for sequences whose
-    // headers were subsequently marked undefined (0xFF) — e.g. after deletion.
-    let sum_ds: usize = (0..59usize)
-        .filter(|&slot| {
-            let d = ds[slot] as usize;
-            if d == 0 { return false; }
-            decoded[sysex_headers_start + slot * SYSEX_HEADER_SIZE] != 0xFF
-        })
-        .map(|slot| ds[slot] as usize)
-        .sum();
-    // Clean declared strips the 21-byte pool preamble that hardware includes.
-    let clean_declared = (EVENT_LEAD_ZEROS + sum_ds) as u32;
 
     // Compute block-padded on-disk size.
-    let padded_total: usize = (0..HEADER_COUNT).filter_map(|slot| {
-        let d = ds[slot] as usize;
-        if d == 0 { return None; }
-        let hdr_src = sysex_headers_start + slot * SYSEX_HEADER_SIZE;
-        if decoded[hdr_src] == 0xFF { return None; }
-        Some((d + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE)
-    }).sum();
+    let padded_total: usize = (0..HW_HEADER_COUNT)
+        .filter(|&slot| ds[slot] > 0)
+        .map(|slot| (ds[slot] as usize + HW_BLOCK_SIZE - 1) / HW_BLOCK_SIZE * HW_BLOCK_SIZE)
+        .sum();
 
     let seq_data_offset = if interleaved_programs.is_some() { SEQ_DATA_WITH_PROGRAMS } else { SEQ_DATA_NO_PROGRAMS };
     let file_size = seq_data_offset + padded_total;
     let mut out = vec![0u8; file_size];
 
-    // Write disk headers: expand each 186-byte SysEx header to 188 bytes (2 trailing zeros).
-    // Stamp our ptr-table-derived ds into [183..186] for seqs 0..58.
-    for slot in 0..HEADER_COUNT {
-        let hdr_src = sysex_headers_start + slot * SYSEX_HEADER_SIZE;
-        let sysex_hdr = &decoded[hdr_src..hdr_src + SYSEX_HEADER_SIZE];
-        let dst = slot * DISK_HEADER_SIZE;
-        out[dst..dst + SYSEX_HEADER_SIZE].copy_from_slice(sysex_hdr);
-        if slot < 59 {
-            let d = ds[slot];
-            out[dst + 183] = ((d >> 16) & 0xFF) as u8;
-            out[dst + 184] = ((d >> 8)  & 0xFF) as u8;
-            out[dst + 185] = ( d        & 0xFF) as u8;
-        }
-        // bytes [dst+186..dst+188] remain zero
+    // Disk headers: copy the 60 × 188-byte SysEx header region, normalizing bytes
+    // 186-187 of each header to zero (on-disk format always stores these as zero;
+    // real hardware SysEx dumps may have non-zero values there).
+    out[..HW_HEADERS_TOTAL].copy_from_slice(sysex_headers);
+    for slot in 0..HW_HEADER_COUNT {
+        out[slot * HW_DISK_HEADER_SIZE + 186] = 0;
+        out[slot * HW_DISK_HEADER_SIZE + 187] = 0;
     }
 
-    // Write disk global: sysex_global[8..29] stripped of 8 SD-1-internal bytes.
-    // Overwrite declared field with clean value (strips 21-byte hardware pool preamble).
-    let sysex_global = &decoded[sysex_global_start..sysex_global_start + SYSEX_GLOBAL_SIZE];
-    out[DISK_GLOBAL_START..DISK_GLOBAL_END].copy_from_slice(&sysex_global[GLOBAL_INTERNAL_BYTES..]);
-    out[DISK_GLOBAL_START + 2..DISK_GLOBAL_START + 6].copy_from_slice(&clean_declared.to_be_bytes());
+    // Disk global: verbatim, with declared end offset recomputed (252 + Σ ds).
+    out[DISK_GLOBAL_START..DISK_GLOBAL_END].copy_from_slice(sysex_global);
+    out[DISK_GLOBAL_START + 2..DISK_GLOBAL_START + 6]
+        .copy_from_slice(&(HW_EVENT_START + sum_ds).to_be_bytes());
 
     if let Some(progs) = interleaved_programs {
         out[PROGRAMS_DISK_OFFSET..PROGRAMS_DISK_OFFSET + PROGRAMS_SIZE].copy_from_slice(progs);
     }
 
-    // Write sequence event data (block-padded per sequence).
+    // Sequence event data, block-padded per sequence, written in slot order.
     let mut out_pos = seq_data_offset;
-    for slot in 0..59usize {
+    for slot in 0..HW_HEADER_COUNT {
         let d = ds[slot] as usize;
         if d == 0 { continue; }
-        let dst = slot * DISK_HEADER_SIZE;
-        if out[dst] == 0xFF { continue; }
-        let pool_off = seq_offsets[slot] as usize;
-        if pool_off + d > pool.len() {
+        let src = src_offset[slot] as usize;
+        if src + d > trailer_start {
             return Err(Error::InvalidSysEx("hardware AllSequences: sequence event data out of bounds"));
         }
-        out[out_pos..out_pos + d].copy_from_slice(&pool[pool_off..pool_off + d]);
-        out_pos += (d + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        out[out_pos..out_pos + d].copy_from_slice(&decoded[src..src + d]);
+        out_pos += (d + HW_BLOCK_SIZE - 1) / HW_BLOCK_SIZE * HW_BLOCK_SIZE;
     }
-    // slot 59: ds[59] = 0, no event data to write
 
     Ok(out)
 }
+
 
 /// INT0 user bank: 10 banks × 6 patches, indexed by b10 value (0–59).
 pub const INT0_PROGRAMS: [&str; 60] = [
@@ -1379,8 +1318,13 @@ mod tests {
         // Verify slot 0: first 186 bytes match, trailing 2 bytes are zero.
         assert_eq!(&disk[..186], &headers[..186]);
         assert_eq!(disk[186], 0); assert_eq!(disk[187], 0);
-        // Global at [11280..11301] = sysex_global[8..29] (strips 8 SD-1-internal bytes).
-        assert_eq!(&disk[11280..11301], &global[8..]);
+        // Global at [11280..11301] = sysex_global[8..29] (strips 8 SD-1-internal bytes),
+        // with the on-disk declared field at [2..6] recomputed to the genuine SD-1
+        // convention: 252 + sum of sequence data sizes.
+        let mut expected_global = [0u8; 21];
+        expected_global.copy_from_slice(&global[8..]);
+        expected_global[2..6].copy_from_slice(&(252u32 + SEQ_DATA_LEN as u32).to_be_bytes());
+        assert_eq!(&disk[11280..11301], &expected_global);
         // Padding at [11301..11776] all zeros
         assert!(disk[11301..11776].iter().all(|&b| b == 0));
         // Sequence data at [11776..11776+170] — matches seq_bytes
@@ -1744,58 +1688,46 @@ mod tests {
     // ── allsequences_hardware_sysex_to_disk ────────────────────────────────────
 
     fn make_hw_sysex_payload(seq0_data: &[u8]) -> Vec<u8> {
-        // Build a minimal hardware AllSequences decoded payload with one defined sequence.
-        const PTR_TABLE_SIZE: usize = 240;
-        const SYSEX_HEADER_SIZE: usize = 186;
-        const HEADER_COUNT: usize = 60;
-        const SYSEX_GLOBAL_SIZE: usize = 29;
-        const EVENT_LEAD_ZEROS: usize = 12;
-        const POOL_PREAMBLE: usize = 21;
-
+        // Build a minimal genuine hardware AllSequences decoded payload with one
+        // defined sequence in slot 0 (see build_hw_allsequences_sysex layout).
         let ds = seq0_data.len();
-        // Hardware pool layout:
-        //   pool[0..12]          = EVENT_LEAD_ZEROS (leading marker)
-        //   pool[12..21]         = 9 HW state bytes (POOL_PREAMBLE - EVENT_LEAD_ZEROS)
-        //   pool[21..21+ds]      = sequence event data
-        //   pool[21+ds..33+ds]   = EVENT_LEAD_ZEROS (trailing sentinel)
-        // pool_size = 12 + 21 + ds = EVENT_LEAD_ZEROS + POOL_PREAMBLE + ds = 33 + ds
-        // total_packed = pool_size - EVENT_LEAD_ZEROS = POOL_PREAMBLE + ds = 21 + ds
-        let pool_size = EVENT_LEAD_ZEROS + POOL_PREAMBLE + ds;
-        let total_packed = POOL_PREAMBLE + ds; // = pool_size - EVENT_LEAD_ZEROS
 
         let mut decoded = Vec::new();
-        // ptr table (240 bytes): base addr at [0..4], seq0 offset at [4..8]
-        decoded.extend_from_slice(&[0x00, 0x04, 0x90, 0x00]); // fake base RAM 0x49000
-        decoded.extend_from_slice(&(POOL_PREAMBLE as u32).to_be_bytes()); // seq0 at pool[21]
-        decoded.resize(PTR_TABLE_SIZE, 0); // remaining entries = 0 (undefined)
+        // ptr table: base addr, constant 21, slot 0 at payload offset 252, rest 0
+        decoded.extend_from_slice(&HW_BASE_ADDRESS.to_be_bytes());
+        decoded.extend_from_slice(&HW_PTR1_CONSTANT.to_be_bytes());
+        decoded.extend_from_slice(&HW_EVENT_START.to_be_bytes());
+        decoded.resize(240, 0);
 
-        // pool: leading EVENT_LEAD_ZEROS, then HW state, then seq data, then trailing sentinel
-        decoded.resize(decoded.len() + EVENT_LEAD_ZEROS, 0); // 12 lead zeros
-        decoded.resize(decoded.len() + 9, 0xBB);             // 9 HW state bytes (arbitrary)
-        decoded.extend_from_slice(seq0_data);                 // seq 0 event data
-        decoded.resize(decoded.len() + EVENT_LEAD_ZEROS, 0); // 12 trailing sentinel bytes
+        // 12 lead zeros, then slot 0 event data
+        decoded.resize(decoded.len() + HW_EVENT_LEAD_ZEROS, 0);
+        decoded.extend_from_slice(seq0_data);
 
-        // Verify pool_size matches
-        assert_eq!(decoded.len() - PTR_TABLE_SIZE, pool_size);
+        // 128-byte trailer
+        decoded.extend_from_slice(&((HW_TRAILER_SIZE + HW_HEADERS_TOTAL) as u32).to_be_bytes());
+        decoded.extend_from_slice(&HW_TRAILER_CONSTANT.to_be_bytes());
+        for k in 0..HW_HEADER_COUNT as u16 {
+            decoded.extend_from_slice(&(HW_TRAILER_SIZE as u16 + HW_DISK_HEADER_SIZE as u16 * k).to_be_bytes());
+        }
 
-        // 60 headers: slot 0 = defined (first byte not 0xFF), rest undefined
-        let mut hdr0 = vec![0x00u8; SYSEX_HEADER_SIZE]; // defined
-        // stamp total_packed-based ds into bytes 183-185
+        // 60 × 188 headers: slot 0 defined with ds, rest undefined
+        let mut hdr0 = vec![0x00u8; HW_DISK_HEADER_SIZE];
         hdr0[183] = ((ds >> 16) & 0xFF) as u8;
         hdr0[184] = ((ds >> 8)  & 0xFF) as u8;
         hdr0[185] = ( ds        & 0xFF) as u8;
         decoded.extend_from_slice(&hdr0);
-        let undef_hdr = vec![0xFFu8; SYSEX_HEADER_SIZE];
-        for _ in 1..HEADER_COUNT {
+        // Undefined headers: 0xFF for the 186 meaningful bytes, zeros for bytes 186..188
+        // (the library disk writer normalizes those two bytes to zero).
+        let mut undef_hdr = vec![0xFFu8; HW_DISK_HEADER_SIZE];
+        undef_hdr[186] = 0;
+        undef_hdr[187] = 0;
+        for _ in 1..HW_HEADER_COUNT {
             decoded.extend_from_slice(&undef_hdr);
         }
 
-        // global (29 bytes): write total_packed (= declared hardware value) at [10..14]
-        // disk_global[2..6] = sysex_global[10..14] after stripping 8 internal bytes
-        let mut global = vec![0u8; SYSEX_GLOBAL_SIZE];
-        // declared = EVENT_LEAD_ZEROS + total_packed (hardware format)
-        let hw_declared = (EVENT_LEAD_ZEROS + total_packed) as u32;
-        global[10..14].copy_from_slice(&hw_declared.to_be_bytes());
+        // 21-byte global, declared end offset = 252 + ds
+        let mut global = vec![0u8; HW_GLOBAL_SIZE];
+        global[2..6].copy_from_slice(&(HW_EVENT_START + ds as u32).to_be_bytes());
         decoded.extend_from_slice(&global);
 
         decoded
@@ -1851,9 +1783,9 @@ mod tests {
         let ds_in_hdr = u32::from_be_bytes([0, disk[183], disk[184], disk[185]]) as usize;
         assert_eq!(ds_in_hdr, 100, "ds for slot 0 should be 100");
 
-        // clean_declared at disk[11280+2..11280+6] = EVENT_LEAD_ZEROS + sum(ds) = 12 + 100 = 112
-        let clean_declared = u32::from_be_bytes([disk[11282], disk[11283], disk[11284], disk[11285]]);
-        assert_eq!(clean_declared, 112, "clean_declared should be EVENT_LEAD_ZEROS + ds = 112");
+        // declared end offset at disk[11280+2..11280+6] = 252 + sum(ds) = 252 + 100 = 352
+        let declared = u32::from_be_bytes([disk[11282], disk[11283], disk[11284], disk[11285]]);
+        assert_eq!(declared, 352, "declared should be 252 + ds = 352");
     }
 
     #[test]
