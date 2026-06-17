@@ -473,7 +473,7 @@ pub fn disk_to_thirty_sequences(disk: &[u8]) -> Result<Vec<u8>> {
         disk_global[2], disk_global[3], disk_global[4], disk_global[5],
     ]);
     if stored_declared == 0 && !packed_events.is_empty() {
-        let declared = packed_events.len() as u32 + EVENT_LEAD_ZEROS as u32;
+        let declared = 252u32 + packed_events.len() as u32;
         sysex_global[10..14].copy_from_slice(&declared.to_be_bytes());
     }
 
@@ -846,8 +846,11 @@ pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u
     }
 
     // Write global: on-disk global = SysEx global[8..29] (strip 8 SD-1-internal bytes).
+    // Overwrite the declared field (global[2..6]) with the correct SD-1 convention value.
     let disk_global = &sysex_global[GLOBAL_INTERNAL_BYTES..];
     out[DISK_GLOBAL_START..DISK_GLOBAL_END].copy_from_slice(disk_global);
+    out[DISK_GLOBAL_START + 2..DISK_GLOBAL_START + 6]
+        .copy_from_slice(&(252u32 + total_ds as u32).to_be_bytes());
 
     // Write sequence data at SEQ_DATA_OFFSET.
     let mut in_pos  = 0usize;
@@ -1440,9 +1443,12 @@ mod tests {
         let sysex_headers_start = payload.len() - 29 - 60 * 186;
         assert_eq!(&disk[..186], &payload[sysex_headers_start..sysex_headers_start + 186]);
         assert_eq!(disk[186], 0); assert_eq!(disk[187], 0);
-        // Global at [5640..5661] = sysex_global[8..29]
+        // Global at [5640..5661] = sysex_global[8..29] with declared field overwritten.
         let global_in_payload = &payload[payload.len() - 29..];
-        assert_eq!(&disk[5640..5661], &global_in_payload[8..]);
+        let mut expected_global = [0u8; 21];
+        expected_global.copy_from_slice(&global_in_payload[8..]);
+        expected_global[2..6].copy_from_slice(&(252u32 + DS as u32).to_be_bytes());
+        assert_eq!(&disk[5640..5661], &expected_global);
         // Padding at [5661..6144] all zeros
         assert!(disk[5661..6144].iter().all(|&b| b == 0));
         // Sequence data at [6144..6144+DS]
@@ -1489,9 +1495,9 @@ mod tests {
         assert_eq!(disk.len(), 6144 + 512);
         assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
 
-        // disk_to_thirty_sequences synthesizes a corrected global (size_sum) when the
-        // on-disk global is zeroed, so disk2 global bytes differ from disk. Assert
-        // that event data and headers survive, and that the second round-trip is stable.
+        // thirty_sequences_to_disk now always writes the correct declared size (252 + Σ ds)
+        // to the on-disk global, so disk and disk2 should have identical globals.
+        // Assert that event data, headers, and global all survive the round-trip.
         let recovered = disk_to_thirty_sequences(&disk).unwrap();
         let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
         assert_eq!(disk2.len(), 6144 + 512);
