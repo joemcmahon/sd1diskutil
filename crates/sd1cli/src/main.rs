@@ -4,7 +4,7 @@ use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
     validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
     disk_to_allsequences, disk_to_thirty_sequences, block1_entries, block1_find, read_hfe, write_hfe,
-    next_file_number, file_type_info, program_name_from_slot, decode_b10,
+    next_file_number, file_type_info, program_name_from_slot, decode_b10, thirty_sequences_to_disk,
 };
 use sd1disk::sysex::SysExPacket;
 use std::path::{Path, PathBuf};
@@ -358,11 +358,23 @@ fn cmd_write(
                 (seq.to_bytes().to_vec(), FileType::OneSequence)
             }
             sd1disk::MessageType::AllSequences => {
-                let disk_data = sd1disk::allsequences_to_disk(
-                    &packet.payload,
-                    interleaved_for_seq.as_deref(),
-                )?;
-                (disk_data, FileType::SixtySequences)
+                // A payload with only 30-slot headers (< 11429 bytes) is a ThirtySequences file.
+                // 60-slot payloads (from disk_to_thirty_sequences or full AllSequences dumps) use
+                // the SixtySequences path; use thirty_sequences_to_disk directly for those.
+                let min_sixty: usize = 240 + 60 * 186 + 29; // 11429
+                if packet.payload.len() < min_sixty {
+                    let disk_data = thirty_sequences_to_disk(
+                        &packet.payload,
+                        interleaved_for_seq.as_deref(),
+                    )?;
+                    (disk_data, FileType::ThirtySequences)
+                } else {
+                    let disk_data = sd1disk::allsequences_to_disk(
+                        &packet.payload,
+                        interleaved_for_seq.as_deref(),
+                    )?;
+                    (disk_data, FileType::SixtySequences)
+                }
             }
             _other => {
                 return Err(sd1disk::Error::InvalidSysEx("unsupported SysEx message type for write"));

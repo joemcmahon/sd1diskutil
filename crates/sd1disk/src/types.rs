@@ -769,13 +769,8 @@ pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u
     const HEADER_COUNT: usize = 30;
     const HEADER_COUNT_SIXTY: usize = 60;
     const SYSEX_GLOBAL_SIZE: usize = 29;
-    const DISK_GLOBAL_SIZE: usize = 21;
-    const GLOBAL_INTERNAL_BYTES: usize = 8;
     const SYSEX_HEADERS_TOTAL_THIRTY: usize = SYSEX_HEADER_SIZE * HEADER_COUNT;        // 5580
     const SYSEX_HEADERS_TOTAL_SIXTY: usize  = SYSEX_HEADER_SIZE * HEADER_COUNT_SIXTY;  // 11160
-    const DISK_HEADERS_TOTAL: usize = DISK_HEADER_SIZE * HEADER_COUNT;                 // 5640
-    const DISK_GLOBAL_START: usize = DISK_HEADERS_TOTAL;                               // 5640
-    const DISK_GLOBAL_END: usize = DISK_GLOBAL_START + DISK_GLOBAL_SIZE;               // 5661
     const EVENT_LEAD_ZEROS: usize = 12;
     const SEQ_DATA_OFFSET: usize = 6144;
     const BLOCK_SIZE: usize = 512;
@@ -798,7 +793,6 @@ pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u
 
     // Locate SysEx headers (186-byte stride) and global (29 bytes).
     let total_header_bytes = if payload.len() >= min_sixty { SYSEX_HEADERS_TOTAL_SIXTY } else { SYSEX_HEADERS_TOTAL_THIRTY };
-    let sysex_global  = &payload[payload.len() - SYSEX_GLOBAL_SIZE..];
     let headers_start = payload.len() - SYSEX_GLOBAL_SIZE - total_header_bytes;
     let headers_sec   = &payload[headers_start..payload.len() - SYSEX_GLOBAL_SIZE];
     let event_data    = &payload[PTR_TABLE_SIZE..headers_start];
@@ -845,12 +839,9 @@ pub fn thirty_sequences_to_disk(payload: &[u8], interleaved_programs: Option<&[u
         // bytes [dst+186..dst+188] remain zero
     }
 
-    // Write global: on-disk global = SysEx global[8..29] (strip 8 SD-1-internal bytes).
-    // Overwrite the declared field (global[2..6]) with the correct SD-1 convention value.
-    let disk_global = &sysex_global[GLOBAL_INTERNAL_BYTES..];
-    out[DISK_GLOBAL_START..DISK_GLOBAL_END].copy_from_slice(disk_global);
-    out[DISK_GLOBAL_START + 2..DISK_GLOBAL_START + 6]
-        .copy_from_slice(&(252u32 + total_ds as u32).to_be_bytes());
+    // Global section [5640..5661] stays all zeros: every genuine ThirtySeq file on
+    // real SD-1 hardware has an all-zero 21-byte global, unlike SixtySeq which stores
+    // (252 + Σ ds) there. `out` is already zeroed, so no write is needed.
 
     // Write sequence data at SEQ_DATA_OFFSET.
     let mut in_pos  = 0usize;
@@ -1443,12 +1434,8 @@ mod tests {
         let sysex_headers_start = payload.len() - 29 - 60 * 186;
         assert_eq!(&disk[..186], &payload[sysex_headers_start..sysex_headers_start + 186]);
         assert_eq!(disk[186], 0); assert_eq!(disk[187], 0);
-        // Global at [5640..5661] = sysex_global[8..29] with declared field overwritten.
-        let global_in_payload = &payload[payload.len() - 29..];
-        let mut expected_global = [0u8; 21];
-        expected_global.copy_from_slice(&global_in_payload[8..]);
-        expected_global[2..6].copy_from_slice(&(252u32 + DS as u32).to_be_bytes());
-        assert_eq!(&disk[5640..5661], &expected_global);
+        // Global at [5640..5661] = all zeros (hardware ThirtySeq format; differs from SixtySeq).
+        assert!(disk[5640..5661].iter().all(|&b| b == 0));
         // Padding at [5661..6144] all zeros
         assert!(disk[5661..6144].iter().all(|&b| b == 0));
         // Sequence data at [6144..6144+DS]
@@ -1495,17 +1482,20 @@ mod tests {
         assert_eq!(disk.len(), 6144 + 512);
         assert_eq!(&disk[6144..6144 + DS], seq_bytes.as_slice());
 
-        // thirty_sequences_to_disk now always writes the correct declared size (252 + Σ ds)
-        // to the on-disk global, so disk and disk2 should have identical globals.
-        // Assert that event data, headers, and global all survive the round-trip.
+        // ThirtySeq global is always all zeros on disk.  disk_to_thirty_sequences synthesizes
+        // a non-zero declared size in the SysEx global so the payload is parseable, but
+        // thirty_sequences_to_disk leaves the on-disk global zeroed to match hardware.
+        assert!(disk[5640..5661].iter().all(|&b| b == 0));
         let recovered = disk_to_thirty_sequences(&disk).unwrap();
         let disk2 = thirty_sequences_to_disk(&recovered, None).unwrap();
         assert_eq!(disk2.len(), 6144 + 512);
         // Event data preserved.
         assert_eq!(&disk2[6144..6144 + DS], seq_bytes.as_slice());
+        // Global remains all zeros after second pass.
+        assert!(disk2[5640..5661].iter().all(|&b| b == 0));
         // Headers (slots 0-29) preserved (30 × 188 bytes on disk).
         assert_eq!(&disk2[..30 * 188], &disk[..30 * 188]);
-        // Second round-trip is stable (global already corrected).
+        // Round-trip is stable.
         let disk3 = thirty_sequences_to_disk(&disk_to_thirty_sequences(&disk2).unwrap(), None).unwrap();
         assert_eq!(disk2, disk3);
     }
@@ -2198,5 +2188,80 @@ mod tests {
         }
         assert_eq!(mismatches, 0,
             "{} header(s) matched, {} mismatched vs 4.syx hardware dump", matches, mismatches);
+    }
+
+    // ── ThirtySequences real-hardware round-trip tests ────────────────────────
+    //
+    // These tests skip gracefully if the reference .bin files are absent.
+    // To run them: copy ROCK-BEATS-real-disk.bin, SWING-SHUFL-real-disk.bin, and
+    // 30-GROOVES-real-disk.bin to the workspace root (next to Cargo.toml).
+    //
+    // The on-disk 188-byte header has 186 bytes of SysEx data + 2 bytes of SD-1
+    // internal state.  Those trailing 2 bytes are NOT preserved in the SysEx format
+    // (SixtySeq always writes zeros there too), so we compare only bytes [0..186]
+    // per header.  Everything else — event data, global, file size — must match exactly.
+
+    fn thirty_seq_round_trip_check(path: &str) {
+        let orig = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        let payload = disk_to_thirty_sequences(&orig)
+            .unwrap_or_else(|e| panic!("{}: disk_to_thirty_sequences failed: {}", path, e));
+        let result = thirty_sequences_to_disk(&payload, None)
+            .unwrap_or_else(|e| panic!("{}: thirty_sequences_to_disk failed: {}", path, e));
+
+        assert_eq!(result.len(), orig.len(),
+            "{}: round-trip size mismatch ({} vs {})", path, result.len(), orig.len());
+
+        // Global section must be all zeros (hardware format).
+        assert!(result[5640..5661].iter().all(|&b| b == 0),
+            "{}: global [5640..5661] is not all zeros after round-trip", path);
+
+        // Header bytes [0..186] of each slot must match (trailing 2 bytes are SD-1 RAM
+        // state that the SysEx format does not carry; they become zero on write-back).
+        for slot in 0..30usize {
+            let orig_hdr  = &orig[slot * 188..slot * 188 + 186];
+            let rt_hdr    = &result[slot * 188..slot * 188 + 186];
+            assert_eq!(orig_hdr, rt_hdr,
+                "{}: header mismatch at slot {} bytes [0..186]", path, slot);
+        }
+
+        // Event data must match exactly.
+        if result.len() > 6144 {
+            assert_eq!(&result[6144..], &orig[6144..result.len()],
+                "{}: event data mismatch", path);
+        }
+    }
+
+    #[test]
+    fn thirty_seq_round_trip_rock_beats() {
+        thirty_seq_round_trip_check("ROCK-BEATS-real-disk.bin");
+    }
+
+    #[test]
+    fn thirty_seq_round_trip_swing_shufl() {
+        thirty_seq_round_trip_check("SWING-SHUFL-real-disk.bin");
+    }
+
+    #[test]
+    fn thirty_seq_round_trip_30_grooves_no_programs() {
+        // 30-GROOVES has embedded programs (type_info 0x20).  Round-trip without
+        // programs only restores the sequence portion; the result will be smaller.
+        let path = "30-GROOVES-real-disk.bin";
+        let orig = match std::fs::read(path) { Ok(b) => b, Err(_) => return };
+        let payload = disk_to_thirty_sequences(&orig)
+            .unwrap_or_else(|e| panic!("{}: disk_to_thirty_sequences failed: {}", path, e));
+        let result = thirty_sequences_to_disk(&payload, None)
+            .unwrap_or_else(|e| panic!("{}: thirty_sequences_to_disk failed: {}", path, e));
+
+        // Global must be all zeros.
+        assert!(result[5640..5661].iter().all(|&b| b == 0),
+            "{}: global not zeroed after no-programs round-trip", path);
+
+        // Header bytes [0..186] for each slot must match.
+        for slot in 0..30usize {
+            let orig_hdr = &orig[slot * 188..slot * 188 + 186];
+            let rt_hdr   = &result[slot * 188..slot * 188 + 186];
+            assert_eq!(orig_hdr, rt_hdr,
+                "{}: header mismatch at slot {}", path, slot);
+        }
     }
 }
