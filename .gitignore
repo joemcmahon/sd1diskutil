@@ -1,1 +1,5 @@
 .worktrees/
+
+# Agent handoffs stay local in public repos
+docs/HANDOFF.md
+docs/archive/
