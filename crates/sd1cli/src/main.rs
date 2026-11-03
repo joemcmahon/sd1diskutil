@@ -69,7 +69,13 @@ By default the file name is taken from the SysEx filename (stem only, up to 11
 characters). Use --name to override. Use --dir to target a specific sub-directory
 (1–4); otherwise the first directory with free slots is used.
 
-Use --overwrite to replace an existing file with the same name.")]
+Use --overwrite to replace an existing file with the same name.
+
+AllSequences SysEx doesn't record whether it came from a ThirtySequences or a
+SixtySequences file (`extract` emits the 60-slot format for both). By default a
+60-slot payload is written as SixtySequences. Use --as thirty to write it as
+ThirtySequences (refused if any of slots 30-59 is defined), or --as sixty to
+force SixtySequences.")]
     Write {
         /// Path to the SD-1 disk image file
         image: PathBuf,
@@ -84,6 +90,10 @@ Use --overwrite to replace an existing file with the same name.")]
         /// Replace an existing file with the same name
         #[arg(long, help = "Overwrite if a file with this name already exists")]
         overwrite: bool,
+        /// Disk file type for AllSequences SysEx
+        #[arg(long = "as", value_enum, default_value_t = SeqTarget::Auto,
+              help = "File type for AllSequences SysEx: auto, thirty, or sixty")]
+        seq_as: SeqTarget,
     },
     /// Extract a file from a disk image as SysEx
     #[command(long_about = "\
@@ -208,8 +218,8 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
     match cli.command {
         Command::List { image } => cmd_list(&image),
         Command::Inspect { image } => cmd_inspect(&image),
-        Command::Write { image, sysex, name, dir, overwrite } =>
-            cmd_write(&image, &sysex, name.as_deref(), dir, overwrite),
+        Command::Write { image, sysex, name, dir, overwrite, seq_as } =>
+            cmd_write(&image, &sysex, name.as_deref(), dir, overwrite, seq_as),
         Command::Extract { image, name, out, channel } =>
             cmd_extract(&image, &name, out.as_deref(), channel),
         Command::Delete { image, name } => cmd_delete(&image, &name),
@@ -282,12 +292,35 @@ fn cmd_inspect(image_path: &Path) -> sd1disk::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SeqTarget { Auto, Thirty, Sixty }
+
+/// AllSequences SysEx doesn't record whether it came from a ThirtySequences or a
+/// SixtySequences file, so `extract` tells the user how to get the type back.
+fn thirty_sequences_hint(out: &Path) -> String {
+    format!("Note: this is a ThirtySequences file; the SysEx doesn't record that.\n\
+             To write it back as ThirtySequences: sd1cli write <disk.img> {} --as thirty",
+            out.display())
+}
+
+/// True if no sequence is defined in slots 30–59 (always true for a 30-slot payload).
+fn upper_sequence_slots_free(payload: &[u8]) -> bool {
+    const HDR: usize = 186;
+    let min_sixty = 240 + 60 * HDR + 29;
+    if payload.len() < min_sixty {
+        return true;
+    }
+    let headers = payload.len() - 29 - 60 * HDR;
+    (30..60).all(|slot| payload[headers + slot * HDR] == 0xFF)
+}
+
 fn cmd_write(
     image_path: &Path,
     sysex_path: &Path,
     name_override: Option<&str>,
     dir_override: Option<u8>,
     overwrite: bool,
+    seq_as: SeqTarget,
 ) -> sd1disk::Result<()> {
     let sysex_bytes = std::fs::read(sysex_path)?;
     let packets = SysExPacket::parse_all(&sysex_bytes)?;
@@ -358,11 +391,24 @@ fn cmd_write(
                 (seq.to_bytes().to_vec(), FileType::OneSequence)
             }
             sd1disk::MessageType::AllSequences => {
-                // A payload with only 30-slot headers (< 11429 bytes) is a ThirtySequences file.
-                // 60-slot payloads (from disk_to_thirty_sequences or full AllSequences dumps) use
-                // the SixtySequences path; use thirty_sequences_to_disk directly for those.
+                // The SysEx doesn't say whether it came from a Thirty- or SixtySequences
+                // file, and `extract` emits the 60-slot format for both. Auto: a payload
+                // with only 30-slot headers (< 11429 bytes) is ThirtySequences, anything
+                // else SixtySequences. `--as thirty` / `--as sixty` override that.
                 let min_sixty: usize = 240 + 60 * 186 + 29; // 11429
-                if packet.payload.len() < min_sixty {
+                let as_thirty = match seq_as {
+                    SeqTarget::Auto => packet.payload.len() < min_sixty,
+                    SeqTarget::Sixty => false,
+                    SeqTarget::Thirty => {
+                        if !upper_sequence_slots_free(&packet.payload) {
+                            return Err(sd1disk::Error::InvalidSysEx(
+                                "--as thirty: sequences are defined in slots 30-59, \
+                                 which a ThirtySequences file can't hold"));
+                        }
+                        true
+                    }
+                };
+                if as_thirty {
                     let disk_data = thirty_sequences_to_disk(
                         &packet.payload,
                         interleaved_for_seq.as_deref(),
@@ -542,6 +588,9 @@ fn cmd_extract(
         .unwrap_or_else(|| PathBuf::from(format!("{}.syx", name)));
     std::fs::write(&out, &sysex_bytes)?;
     println!("Extracted: {} -> {}", name, out.display());
+    if entry.file_type == FileType::ThirtySequences {
+        println!("{}", thirty_sequences_hint(&out));
+    }
     Ok(())
 }
 
@@ -835,5 +884,89 @@ fn print_command_payload(payload: &[u8]) {
     match extra {
         Some(detail) => println!("Command 0x{:02X}: {} ({})", cmd, name, detail),
         None         => println!("Command 0x{:02X}: {}", cmd, name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real-hardware fixture in the repo root; tests skip if it's absent.
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(name)).ok()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sd1cli-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_allsequences_syx(dir: &Path, payload: Vec<u8>) -> PathBuf {
+        let p = dir.join("RT.syx");
+        let pkt = SysExPacket { message_type: MessageType::AllSequences, midi_channel: 0, model: 0, payload };
+        std::fs::write(&p, pkt.to_bytes(0)).unwrap();
+        p
+    }
+
+    /// Write `payload` as AllSequences SysEx into a blank image; return the directory entry.
+    fn write_to_blank(tag: &str, payload: Vec<u8>, seq_as: SeqTarget)
+        -> sd1disk::Result<(DirectoryEntry, PathBuf, PathBuf)>
+    {
+        let dir = scratch(tag);
+        let img_path = dir.join("t.img");
+        cmd_create(&img_path).unwrap();
+        let syx = write_allsequences_syx(&dir, payload);
+        cmd_write(&img_path, &syx, Some("RT"), None, false, seq_as)?;
+        let img = DiskImage::open(&img_path).unwrap();
+        let entry = (0..4u8).find_map(|i| SubDirectory::new(i).find(&img, "RT")).expect("RT written");
+        Ok((entry, img_path, syx))
+    }
+
+    #[test]
+    fn write_as_thirty_round_trips_a_thirty_sequences_file() {
+        let Some(orig) = fixture("ROCK-BEATS-real-disk.bin") else { return };
+        let payload = disk_to_thirty_sequences(&orig).unwrap();
+        let (entry, img_path, syx) = write_to_blank("thirty", payload, SeqTarget::Thirty).unwrap();
+        assert_eq!(entry.file_type, FileType::ThirtySequences);
+        assert_eq!(entry.size_blocks as usize, orig.len().div_ceil(512),
+            "written file should be the same size as the original ThirtySequences file");
+        // extract -> write --as thirty -> extract gives back identical SysEx
+        let out = img_path.with_file_name("again.syx");
+        cmd_extract(&img_path, "RT", Some(&out), 0).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&syx).unwrap());
+    }
+
+    #[test]
+    fn write_default_keeps_sixty_slot_payload_as_sixty_sequences() {
+        let Some(orig) = fixture("ROCK-BEATS-real-disk.bin") else { return };
+        let payload = disk_to_thirty_sequences(&orig).unwrap();
+        let (entry, _, _) = write_to_blank("auto", payload, SeqTarget::Auto).unwrap();
+        assert_eq!(entry.file_type, FileType::SixtySequences,
+            "without --as, a 60-slot payload is ambiguous and stays SixtySequences");
+    }
+
+    #[test]
+    fn write_as_thirty_refuses_payload_using_slots_beyond_29() {
+        let Some(orig) = fixture("ROCK-BEATS-real-disk.bin") else { return };
+        let mut payload = disk_to_thirty_sequences(&orig).unwrap();
+        // Mark slot 30 as defined (headers: 60 x 186 bytes, just before the 29-byte global).
+        let hdr0 = payload.len() - 29 - 60 * 186;
+        payload[hdr0 + 30 * 186] = 0;
+        let result = write_to_blank("reject", payload, SeqTarget::Thirty);
+        match result {
+            Err(sd1disk::Error::InvalidSysEx(msg)) => assert!(
+                msg.contains("slots 30-59"), "wrong refusal: {msg}"),
+            other => panic!("expected the slots-30-59 refusal, got {:?}",
+                other.map(|r| r.0.file_type)),
+        }
+    }
+
+    #[test]
+    fn extract_hint_tells_how_to_write_a_thirty_sequences_file_back() {
+        let hint = thirty_sequences_hint(Path::new("ROCK.syx"));
+        assert!(hint.contains("--as thirty"), "{hint}");
+        assert!(hint.contains("ROCK.syx"), "{hint}");
     }
 }
