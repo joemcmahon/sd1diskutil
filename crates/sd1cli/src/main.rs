@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand};
 use sd1disk::{
     DiskImage, SubDirectory, FileAllocationTable, Program, Preset, Sequence,
-    validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs,
+    validate_name, DirectoryEntry, FileType, MessageType, deinterleave_sixty_programs, embedded_programs,
     disk_to_allsequences, disk_to_thirty_sequences, block1_entries, block1_find, read_hfe, write_hfe,
     next_file_number, file_type_info, program_name_from_slot, decode_b10, thirty_sequences_to_disk,
 };
@@ -539,6 +539,18 @@ fn cmd_extract(
         raw.truncate(entry.size_bytes as usize);
     }
 
+    // Sequence files can carry 60 embedded programs; emit them as an AllPrograms
+    // packet ahead of AllSequences (write re-embeds them when both are present).
+    let programs_sysex = match embedded_programs(&raw, &entry.file_type, entry.type_info)? {
+        Some(payload) => sd1disk::sysex::SysExPacket {
+            message_type: sd1disk::MessageType::AllPrograms,
+            midi_channel: channel,
+            model: 0,
+            payload,
+        }.to_bytes(channel),
+        None => Vec::new(),
+    };
+
     let sysex_bytes = match entry.file_type {
         FileType::OneProgram => {
             Program::from_bytes(&raw)?.to_sysex(channel).to_bytes(channel)
@@ -586,6 +598,7 @@ fn cmd_extract(
 
     let out = out_path.map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(format!("{}.syx", name)));
+    let sysex_bytes = [programs_sysex, sysex_bytes].concat();
     std::fs::write(&out, &sysex_bytes)?;
     println!("Extracted: {} -> {}", name, out.display());
     if entry.file_type == FileType::ThirtySequences {
@@ -961,6 +974,87 @@ mod tests {
             other => panic!("expected the slots-30-59 refusal, got {:?}",
                 other.map(|r| r.0.file_type)),
         }
+    }
+
+    /// The repo's copy of the factory Sequencer OS disk (has COUNTRY-* and 30-GROOVES).
+    fn factory_disk() -> Option<PathBuf> {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../disk_with_everything.img");
+        p.exists().then_some(p)
+    }
+
+    fn find_entry(img: &DiskImage, name: &str) -> DirectoryEntry {
+        (0..4u8).find_map(|i| SubDirectory::new(i).find(img, name)).expect(name)
+    }
+
+    /// File bytes in FAT-chain order.
+    fn raw_file(img_path: &Path, name: &str) -> (DirectoryEntry, Vec<u8>) {
+        let img = DiskImage::open(img_path).unwrap();
+        let e = find_entry(&img, name);
+        let mut raw = Vec::new();
+        for b in FileAllocationTable::chain(&img, e.first_block as u16).unwrap() {
+            raw.extend_from_slice(img.block(b).unwrap());
+        }
+        (e, raw)
+    }
+
+    fn packets(path: &Path) -> Vec<SysExPacket> {
+        SysExPacket::parse_all(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// extract NAME from the factory disk, write it to a blank disk, return both raw files.
+    fn programs_round_trip(tag: &str, name: &str, seq_as: SeqTarget)
+        -> (DirectoryEntry, Vec<u8>, DirectoryEntry, Vec<u8>, PathBuf)
+    {
+        let src = factory_disk().unwrap();
+        let dir = scratch(tag);
+        let syx = dir.join("x.syx");
+        cmd_extract(&src, name, Some(&syx), 0).unwrap();
+        let img_path = dir.join("t.img");
+        cmd_create(&img_path).unwrap();
+        cmd_write(&img_path, &syx, Some("RT"), None, false, seq_as).unwrap();
+        let (e0, raw0) = raw_file(&src, name);
+        let (e1, raw1) = raw_file(&img_path, "RT");
+        (e0, raw0, e1, raw1, syx)
+    }
+
+    #[test]
+    fn extract_includes_embedded_programs_of_a_sixty_sequences_file() {
+        let Some(src) = factory_disk() else { return };
+        let dir = scratch("x60");
+        let syx = dir.join("x.syx");
+        cmd_extract(&src, " COUNTRY-*", Some(&syx), 0).unwrap();
+        let (entry, raw) = raw_file(&src, " COUNTRY-*");
+        assert_ne!(entry.type_info & 0x20, 0, "fixture should have programs embedded");
+        let pk = packets(&syx);
+        let kinds: Vec<_> = pk.iter().map(|p| p.message_type.clone()).collect();
+        assert_eq!(kinds, vec![MessageType::AllPrograms, MessageType::AllSequences]);
+        assert_eq!(pk[0].payload, deinterleave_sixty_programs(&raw[11776..43576]).unwrap());
+    }
+
+    #[test]
+    fn sixty_sequences_round_trip_keeps_embedded_programs() {
+        if factory_disk().is_none() { return }
+        let (e0, raw0, e1, raw1, _) = programs_round_trip("rt60", " COUNTRY-*", SeqTarget::Auto);
+        assert_eq!(e1.file_type, FileType::SixtySequences);
+        assert_ne!(e1.type_info & 0x20, 0, "programs-embedded flag lost");
+        assert_eq!(raw1[11776..43576], raw0[11776..43576], "embedded programs changed");
+        assert_eq!(e1.size_blocks, e0.size_blocks);
+    }
+
+    #[test]
+    fn thirty_sequences_round_trip_keeps_embedded_programs() {
+        if factory_disk().is_none() { return }
+        let (e0, raw0, e1, raw1, syx) = programs_round_trip("rt30", " 30-GROOVES", SeqTarget::Thirty);
+        assert_eq!(e1.file_type, FileType::ThirtySequences);
+        assert_ne!(e1.type_info & 0x20, 0, "programs-embedded flag lost");
+        assert_eq!(e1.size_blocks, e0.size_blocks, "programs dropped: file shrank");
+        // Programs (31800 bytes) follow the block-padded sequence data. The 456 bytes
+        // after them hold SD-1 RAM residue on hardware-written disks (like the last 2
+        // bytes of each 188-byte header); SysEx doesn't carry it and the writer zeros it.
+        let start = raw0.len() - (31800 + 456);
+        assert_eq!(raw1[start..start + 31800], raw0[start..start + 31800],
+                   "embedded programs changed");
+        assert_eq!(packets(&syx)[0].message_type, MessageType::AllPrograms);
     }
 
     #[test]

@@ -148,10 +148,13 @@ pub fn next_file_number(img: &DiskImage, file_type: &FileType) -> u8 {
         .count() as u8
 }
 
-/// Return the type_info byte for a directory entry.
-/// Only SixtySequences with embedded programs uses 0x20; everything else is 0x00.
+/// Directory `type_info` byte for a file we write. Bit 5 (0x20) marks a sequence
+/// file with 60 programs embedded: SixtySequences store them before the sequence
+/// data, ThirtySequences after it. Real hardware sets the bit on both (e.g. the
+/// factory 30-GROOVES entry is 0x20). Every other type is written as 0x00.
 pub fn file_type_info(file_type: &FileType, programs_embedded: bool) -> u8 {
-    if *file_type == FileType::SixtySequences && programs_embedded { 0x20 } else { 0x00 }
+    let is_sequences = matches!(file_type, FileType::SixtySequences | FileType::ThirtySequences);
+    if is_sequences && programs_embedded { 0x20 } else { 0x00 }
 }
 
 /// Validate that a name fits in 11 bytes and is non-empty.
@@ -513,6 +516,9 @@ mod tests {
     #[test]
     fn file_type_info_is_0x20_for_sequences_with_programs_embedded() {
         assert_eq!(file_type_info(&FileType::SixtySequences, true), 0x20);
+        // Hardware sets the same bit on ThirtySequences with programs (factory 30-GROOVES: 0x20).
+        assert_eq!(file_type_info(&FileType::ThirtySequences, true), 0x20);
+        assert_eq!(file_type_info(&FileType::ThirtySequences, false), 0x00);
     }
 
     #[test]

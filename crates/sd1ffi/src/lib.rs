@@ -1340,6 +1340,40 @@ pub extern "C" fn sd1_interleave_sixty_programs(
     }
 }
 
+/// Programs embedded in a ThirtySequences/SixtySequences file (directory type_info
+/// bit 0x20), as an AllPrograms SysEx payload (60 × 530 bytes).
+/// On success with no embedded programs, *out is NULL and *out_len is 0.
+/// Otherwise the caller must call sd1_bytes_free(*out, *out_len).
+#[no_mangle]
+pub extern "C" fn sd1_embedded_programs(
+    data: *const u8,
+    len: usize,
+    file_type_byte: u8,
+    type_info: u8,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if data.is_null() || out.is_null() || out_len.is_null() { return error::SD1_ERR_IO; }
+    unsafe { *out = std::ptr::null_mut(); *out_len = 0; }
+    let file_type = match FileType::from_byte(file_type_byte) {
+        Ok(ft) => ft,
+        Err(e) => return to_error_code(&e),
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    match sd1disk::embedded_programs(bytes, &file_type, type_info) {
+        Ok(None) => SD1_OK,
+        Ok(Some(result)) => {
+            let result_len = result.len();
+            let mut boxed = result.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out = ptr; *out_len = result_len; }
+            SD1_OK
+        }
+        Err(e) => to_error_code(&e),
+    }
+}
+
 /// De-interleave on-disk SixtyPrograms data back to AllPrograms SysEx payload order.
 /// Caller must call sd1_bytes_free(*out, *out_len).
 #[no_mangle]
@@ -1976,6 +2010,31 @@ mod tests {
         let rc = sd1_disk_write(img, name.as_ptr(), 0x0A, false, data.as_ptr(), data.len(), false);
         assert_eq!(rc, error::SD1_ERR_FILE_EXISTS);
         sd1_disk_free(img);
+    }
+
+    #[test]
+    fn embedded_programs_returns_payload_for_flagged_sixty_sequences() {
+        let mut raw = vec![0u8; 44032];
+        for (i, b) in raw[11776..43576].iter_mut().enumerate() { *b = (i % 251) as u8; }
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = sd1_embedded_programs(raw.as_ptr(), raw.len(), 0x13, 0x20, &mut out, &mut out_len);
+        assert_eq!(rc, SD1_OK);
+        assert_eq!(out_len, 60 * 530);
+        let got = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
+        sd1_bytes_free(out, out_len);
+        assert_eq!(got, sd1disk::deinterleave_sixty_programs(&raw[11776..43576]).unwrap());
+    }
+
+    #[test]
+    fn embedded_programs_returns_null_without_flag() {
+        let raw = vec![0u8; 44032];
+        let mut out: *mut u8 = 1 as *mut u8;
+        let mut out_len: usize = 99;
+        let rc = sd1_embedded_programs(raw.as_ptr(), raw.len(), 0x13, 0x00, &mut out, &mut out_len);
+        assert_eq!(rc, SD1_OK);
+        assert!(out.is_null());
+        assert_eq!(out_len, 0);
     }
 
     #[test]

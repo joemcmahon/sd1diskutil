@@ -230,6 +230,11 @@ sd1cli extract <IMAGE> <NAME> [--out <PATH>] [--channel <0-15>]
 
 Extracts a named file from a disk image and saves it as a SysEx `.syx` file.
 
+Sequence files (ThirtySequences/SixtySequences) that carry 60 embedded programs are
+extracted as two packets, AllPrograms then AllSequences, so `write` can embed the
+programs again. For a ThirtySequences file, `extract` prints a reminder to write it
+back with `--as thirty`.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--out PATH` | `<NAME>.syx` | Output file path |

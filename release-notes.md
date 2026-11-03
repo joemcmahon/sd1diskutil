@@ -1,11 +1,14 @@
-## v1.19 — ThirtySequences round-trip; recovery extractor: ThirtySequences, embedded programs, fragmented files
+## v1.19 — Lossless sequence round trips (ThirtySequences type, embedded programs); recovery extractor rework
 
-### sd1cli: ThirtySequences round trip
+### sd1cli: lossless sequence round trips
 
 - **Bug:** `sd1cli extract` followed by `sd1cli write` turned a ThirtySequences file into SixtySequences (e.g. ROCK-BEATS: 35 → 46 blocks). AllSequences SysEx doesn't record which file type it came from, and `extract` emits the hardware-compatible 60-slot format for both, so v1.18's size check (short payload ⇒ ThirtySequences) never fired. The type can't be inferred from content either: all five SixtySequences files on the factory Sequencer OS disk use only slots 0–29.
 - **New `sd1cli write --as auto|thirty|sixty`.** `--as thirty` writes the SysEx as a ThirtySequences file (refused if any of slots 30–59 is defined); `--as sixty` forces SixtySequences; `auto` (the default) behaves as before.
 - **`sd1cli extract`** now prints a hint when the source is a ThirtySequences file, showing the `--as thirty` command to write it back.
-- Note: AllSequences SysEx doesn't carry programs, so a ThirtySequences file with embedded programs (e.g. 30-GROOVES) comes back without them.
+- **Bug: embedded programs were dropped.** `extract` emitted only the AllSequences packet, so the 60 programs embedded in a sequence file were lost on extract → write. On the factory Sequencer OS disk that hit five files: COUNTRY-\*, SD1-PALETTE, PETROUCHKA\*, BASSICS-\* (SixtySequences, programs before the sequence data) and 30-GROOVES (ThirtySequences, programs after it). `extract` now emits **AllPrograms + AllSequences** for these, and `write` (which already embeds programs when both packets are present) puts them back byte-for-byte.
+- **Programs flag on ThirtySequences:** `file_type_info` now sets bit `0x20` for ThirtySequences with embedded programs as well as SixtySequences, matching real hardware (the factory 30-GROOVES entry is `0x20`).
+- **New library/FFI function `embedded_programs` / `sd1_embedded_programs`** returns a sequence file's embedded programs as an AllPrograms payload; `sd1cli` and `sd1cli-ffi` both use it, so their extract output stays identical.
+- Known limit: the 456 bytes after a ThirtySequences file's programs hold SD-1 RAM residue on hardware-written disks; SysEx can't carry it and `write` zeros it (like the last 2 bytes of each 188-byte header).
 
 ### Recovery extractor features
 
@@ -22,7 +25,9 @@
 - Verified byte-for-byte against `sd1cli extract` on all 11 sequence files of the factory Sequencer OS v4.10 disk: 164/164 sequences (previously 49 wrong, 14 missing).
 - `ascension.img` SEQ-ASCESEQ (embedded programs): 20/20; MUZAK3 `ALEX 96` output unchanged.
 - Damage tests: unrecovered FAT block under a fragmented file yields no output (never wrong output); a zeroed data block skips only the affected slot.
-- 165 Rust tests, all passing (sd1disk: 120 + 11 integration, sd1ffi: 30, sd1cli: 4 new: `--as thirty` round trip of ROCK-BEATS is byte-identical, default unchanged, slots 30–59 refusal, extract hint).
+- 174 Rust tests, all passing (sd1disk: 124 + 11 integration, sd1ffi: 32, sd1cli: 7). New: `--as thirty` round trip, default unchanged, slots 30–59 refusal, extract hint; embedded programs survive extract → write for COUNTRY-\* (SixtySequences) and 30-GROOVES (ThirtySequences); `embedded_programs` / `sd1_embedded_programs` unit tests.
+- All five embedded-programs files on the factory disk round-trip with programs byte-identical, flag and block count preserved, and identical SysEx on re-extract.
+- `scripts/test-equivalence.sh` (sd1cli vs sd1cli-ffi) and `scripts/verify-roundtrip.sh`: 36 passed, 0 failed on `disk_with_everything.img`.
 
 ## v1.18 — ThirtySequences: zeroed global section and CLI write dispatch
 

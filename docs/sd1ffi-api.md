@@ -458,6 +458,15 @@ int sd1_deinterleave_sixty_programs(const uint8_t* data, size_t len,
 ```
 Convert between the AllPrograms SysEx payload (60 programs in order, 60 × 530 = 31,800 bytes) and the on-disk SixtyPrograms interleaved format. The interleaved format byte-interleaves programs 0–29 (even bytes) with programs 30–59 (odd bytes) so the hardware can address each program by index.
 
+```c
+int sd1_embedded_programs(const uint8_t* data, size_t len,
+                          uint8_t file_type_byte, uint8_t type_info,
+                          uint8_t** out, size_t* out_len);
+```
+Return the 60 programs embedded in a ThirtySequences or SixtySequences file as an AllPrograms SysEx payload (31,800 bytes, program order). Pass the raw file bytes from `sd1_disk_extract` plus the directory entry's `file_type` and `type_info`. Programs are present when `type_info` has bit `0x20` set; real hardware sets it on both sequence types. SixtySequences keep them at offset 11,776 (before the sequence data), ThirtySequences right after the block-padded sequence data. If there are none, returns `SD1_OK` with `*out = NULL` and `*out_len = 0`; otherwise free with `sd1_bytes_free`.
+
+To round-trip a sequence file without losing its programs, emit an AllPrograms packet followed by the AllSequences packet; writing both back embeds the programs again (`sd1cli extract` / `sd1cli write` do this).
+
 ---
 
 ## Program utilities

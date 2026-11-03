@@ -519,6 +519,19 @@ int32_t sd1_interleave_sixty_programs(const uint8_t *payload,
                                       uintptr_t *out_len);
 
 /**
+ * Programs embedded in a ThirtySequences/SixtySequences file (directory type_info
+ * bit 0x20), as an AllPrograms SysEx payload (60 × 530 bytes).
+ * On success with no embedded programs, *out is NULL and *out_len is 0.
+ * Otherwise the caller must call sd1_bytes_free(*out, *out_len).
+ */
+int32_t sd1_embedded_programs(const uint8_t *data,
+                              uintptr_t len,
+                              uint8_t file_type_byte,
+                              uint8_t type_info,
+                              uint8_t **out,
+                              uintptr_t *out_len);
+
+/**
  * De-interleave on-disk SixtyPrograms data back to AllPrograms SysEx payload order.
  * Caller must call sd1_bytes_free(*out, *out_len).
  */
