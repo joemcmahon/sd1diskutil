@@ -225,20 +225,21 @@ sd1cli write sounds.img ROCK-BEATS.syx --as thirty
 ### extract
 
 ```
-sd1cli extract <IMAGE> <NAME> [--out <PATH>] [--channel <0-15>]
+sd1cli extract <IMAGE> <NAME> [--out <PATH>] [--channel <0-15>] [--no-programs]
 ```
 
 Extracts a named file from a disk image and saves it as a SysEx `.syx` file.
 
 Sequence files (ThirtySequences/SixtySequences) that carry 60 embedded programs are
 extracted as two packets, AllPrograms then AllSequences, so `write` can embed the
-programs again. For a ThirtySequences file, `extract` prints a reminder to write it
-back with `--as thirty`.
+programs again (use `--no-programs` for the pre-v1.19 AllSequences-only output). For a
+ThirtySequences file, `extract` prints a reminder to write it back with `--as thirty`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--out PATH` | `<NAME>.syx` | Output file path |
 | `--channel N` | `0` (MIDI channel 1) | MIDI channel embedded in the SysEx header |
+| `--no-programs` | off | Sequence files: omit embedded programs (AllSequences only, as before v1.19) |
 
 **Examples:**
 
