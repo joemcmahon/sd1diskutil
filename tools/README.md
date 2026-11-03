@@ -20,9 +20,16 @@
 - Usage: `python3 tools/triage_sequences.py <image.img>`
 
 ## tools/extract_intact_sequences.py
-- Extracts only fully-intact sequences from a damaged SixtySequences file
+- Extracts only fully-intact sequences from a damaged SixtySequences or ThirtySequences file
 - Writes each intact slot as a standalone OneSequence SysEx (.syx) loadable by SD-1 hardware
+- Finds files in all four subdirectories (and the VST3 plugin's block-1 directory), like `sd1cli list`
 - Usage: `python3 tools/extract_intact_sequences.py <image.img> <file_name> [--channel N] [--outdir DIR]`
+- Handles SixtySequences with embedded programs (event data at 44032) and fragmented files
+  (follows the FAT chain past the contiguous run)
+- Limitation: if a defined slot's header is unreadable, later slots can't be located (the
+  event-pool cursor is lost); blocks the FAT can't account for are treated as unrecoverable
+- Verified byte-for-byte against `sd1cli extract` on all 11 sequence files of the factory
+  Sequencer OS v4.10 disk (164 sequences)
 
 ## Typical workflow for a damaged disk
 ```
