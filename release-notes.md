@@ -1,3 +1,22 @@
+## v1.19 — Recovery extractor: ThirtySequences, embedded programs, fragmented files
+
+### Features
+
+- **`tools/extract_intact_sequences.py`** now extracts intact sequences from **ThirtySequences** files as well as SixtySequences.
+
+### Bug fixes
+
+- **Embedded programs:** SixtySequences files with programs embedded (directory `type_info` bit `0x20`) keep their event data at byte 44032, not 11776. The extractor always read from 11776, so for these files it wrapped program data as sequences, and `sd1cli write` accepted them without complaint. **Any `.syx` previously extracted from such a file with this tool is wrong and should be re-extracted.**
+- **Fragmented files:** the extractor read files as one contiguous run from `first_block`. It now takes the first `contiguous_blocks` from the directory entry and follows the FAT chain for the rest. Blocks the chain can't account for (unrecovered FAT block, corrupt entry) are treated as unrecoverable rather than guessed.
+- **Directory lookup:** only subdirectory 0 was searched, and entries from slot 19 on were misread. All four subdirectories (39 entries each) and the VST3 block-1 directory are now searched, with only valid file types accepted, matching `sd1cli list`.
+
+### Testing
+
+- Verified byte-for-byte against `sd1cli extract` on all 11 sequence files of the factory Sequencer OS v4.10 disk: 164/164 sequences (previously 49 wrong, 14 missing).
+- `ascension.img` SEQ-ASCESEQ (embedded programs): 20/20; MUZAK3 `ALEX 96` output unchanged.
+- Damage tests: unrecovered FAT block under a fragmented file yields no output (never wrong output); a zeroed data block skips only the affected slot.
+- 161 Rust tests, all passing (sd1disk: 120, sd1cli: 11, sd1ffi: 30).
+
 ## v1.15 — Fix hardware SysEx global declared-size field
 
 ### Bug fixes
