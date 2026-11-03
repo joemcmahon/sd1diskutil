@@ -17,6 +17,42 @@
 - Damage tests: unrecovered FAT block under a fragmented file yields no output (never wrong output); a zeroed data block skips only the affected slot.
 - 161 Rust tests, all passing (sd1disk: 120, sd1cli: 11, sd1ffi: 30).
 
+## v1.18 — ThirtySequences: zeroed global section and CLI write dispatch
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+### Bug fixes
+
+- **`thirty_sequences_to_disk`** no longer writes `252 + Σ ds` into the 21-byte global section at offset 5640. Every genuine ThirtySequences file written by SD-1 hardware has zeros there; the non-zero value (introduced in v1.17) caused **System Error 29** on load. The global section is now left zeroed.
+- **`sd1cli write`** always routed AllSequences SysEx to `allsequences_to_disk` and tagged the result SixtySequences. Payloads shorter than 11429 bytes (the 30-slot header region) are now written as ThirtySequences.
+
+### Testing
+
+- Three real-hardware reference files added as fixtures (`ROCK-BEATS-real-disk.bin`, `SWING-SHUFL-real-disk.bin`, `30-GROOVES-real-disk.bin`), with integration tests that round-trip them through `disk_to_thirty_sequences` → `thirty_sequences_to_disk` and check that the global is zero, header bytes `[0..186]` match, and event data is identical.
+
+## v1.17 — ThirtySequences declared-size field
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+### Bug fixes
+
+- **`thirty_sequences_to_disk`** copied the SysEx global verbatim without updating the declared event-area size (`global[2..6]`), so files written with a zeroed or incorrect global could cause SD-1 system error :29/:129 on load. It now always writes `252 + Σ ds`. **Superseded in v1.18:** real ThirtySequences files keep this section zeroed, and v1.18 does so.
+- **`disk_to_thirty_sequences`** synthesized the wrong declared size (`Σ ds + 12` instead of `252 + Σ ds`) when patching a zeroed on-disk global.
+
+## v1.16 — Sequence data length from slot headers; hardware SysEx refactor
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+### Bug fixes
+
+- **`allsequences_to_disk`** computed the sequence data length from the declared size in the SysEx global section. When importing from a disk image with a zeroed global (a known hardware quirk) that value is 0, so no sequence data was written. The length now comes from the per-slot `ds` values in the headers, which are always authoritative, and the correct declared size (`252 + Σ ds`) is written to the on-disk global on every conversion.
+- **Hardware SysEx round-trip stability:** bytes 186–187 of each 188-byte header are now normalized to zero when converting hardware SysEx to disk; the on-disk format requires zeros there, but real hardware may not write them.
+- **Slots 58 and 59** are both recognized as lacking pointer-table entries in hardware SysEx (previously only slot 59 was handled).
+
+### Internal
+
+- Hardware SysEx functions (`disk_to_allsequences_hw_sysex`, `disk_to_thirty_sequences_hw_sysex`, `allsequences_hardware_sysex_to_disk`) refactored onto shared `HW_*` constants and a `build_hw_allsequences_sysex` helper, replacing the earlier pool-based approach.
+
 ## v1.15 — Fix hardware SysEx global declared-size field
 
 ### Bug fixes
@@ -177,3 +213,102 @@ Both declared in `sd1disk.h`.
 
 - 135 unit/integration tests, all passing
 - Verified against a real SD-1 hardware dump (`4.syx`): header strides, global offsets, and declared sizes all confirmed correct at 186/29
+
+## v1.6 — AllSequences pointer table fix + FFI equivalence testing
+
+### Bug fixes
+
+- **AllSequences and ThirtySequences pointer table was all zeros**: The 60-entry pointer table at bytes 0–239 of the AllSequences SysEx payload was being emitted as 240 zero bytes. The SD-1 firmware and MAME use this table directly to locate per-sequence event data — they do not rebuild it from headers on receive. The table is now computed as cumulative 4-byte big-endian byte offsets into the event data area. For ThirtySequences, slots 30–59 all receive the total event data size as their value.
+
+### New features
+
+- **`sd1cli-ffi` binary**: New Rust binary that calls the `sd1ffi` C API functions directly (via rlib linkage) for all disk operations. Produces identical SysEx output to `sd1cli`, confirmed across 36 files covering all supported file types on a reference disk.
+
+### Testing
+
+- 135 unit/integration tests, all passing
+- New `scripts/test-equivalence.sh`: extracts every SysEx-capable file from a reference disk using both `sd1cli` and `sd1cli-ffi`, diffs outputs byte-for-byte; 36/36 pass
+
+## v1.5 — Fix sd1_disk_extract truncation for sequence files
+
+### Bug fix
+
+`sd1_disk_extract` now returns the full block-aligned FAT chain data for `SD1_FILE_THIRTY_SEQUENCES` and `SD1_FILE_SIXTY_SEQUENCES` files, instead of truncating to `size_bytes`.
+
+**Root cause:** Hardware-written sequence files store `size_bytes` as the unpadded logical size. Sequence event data is block-padded on disk, so later slots have data at block-aligned offsets that fall past `size_bytes`. Truncating to `size_bytes` before passing to `sd1_disk_to_thirty_sequences` or `sd1_disk_to_allsequences` caused `SD1_ERR_INVALID_SYSEX` for any file where block-padded event data extended past the logical size.
+
+**Impact:** Any caller using `sd1_disk_extract` → `sd1_disk_to_thirty_sequences` / `sd1_disk_to_allsequences` on hardware-written disk images. Files written by sd1diskutil itself were unaffected (our writer sets `size_bytes` to the full padded length). The CLI (`sd1cli extract`) was also unaffected — it already skipped truncation for these types.
+
+### Changes
+- `crates/sd1ffi/src/lib.rs` — skip truncation for ThirtySequences/SixtySequences in `sd1_disk_extract`
+- `docs/sd1ffi-api.md` — document the block-aligned return size behaviour
+- Regression test added
+
+## v1.4.1 — Documentation and tooling additions
+
+### API documentation
+
+Added `sd1_disk_to_thirty_sequences` and `sd1_thirty_sequences_to_disk` to the C/C++ API reference (`docs/sd1ffi-api.md`), including layout notes explaining the key differences from SixtySequences:
+
+- Sequence data always starts at offset 6144 (independent of whether programs are present)
+- When programs are embedded, they appear *after* the sequence data rather than before it
+- No `has_programs` flag needed for decoding (offset is fixed)
+
+### Torture test script
+
+Added `scripts/torture-write.sh`: recursively writes a directory of SysEx files to SD-1 disk images, rolling over to a new image on `Disk full` or `Directory full`. Validated against 1,083 real-world SD-1 SysEx dumps from a hardware instrument — 1,081 written successfully across 14 disk images, 2 skipped (malformed/non-SD-1 data), 0 failures.
+
+## v1.4 — ThirtySequences support + extraction fixes
+
+### New features
+
+- **ThirtySequences (0x12) read**: `extract` now correctly decodes ThirtySequences files into a 60-slot AllSequences SysEx payload (slots 0–29 from disk; slots 30–59 set to undefined). Previously these were incorrectly wrapped as SingleSequence SysEx.
+- **ThirtySequences write**: New `thirty_sequences_to_disk` function converts an AllSequences SysEx payload back to on-disk ThirtySequences format. Programs (if any) are placed after sequence data, matching real hardware layout.
+- **TwentyPresets extract**: `extract` now correctly produces AllPresets SysEx from TwentyPresets disk files. Previously TwentyPresets could be written to disk but not extracted.
+
+### Bug fixes
+
+- **CLASS-PNO-\* and other SixtySequences files failed to extract**: The CLI was truncating raw block-chain data to `size_bytes` before decoding. The SD-1 stores the logical SysEx payload length in `size_bytes`, not the on-disk block size. Sequence decoders now receive full block-aligned data.
+- **ThirtySequences write-back panicked on real hardware files**: Files written by real SD-1 hardware sometimes have an all-zeros global section (e.g. ROCK-BEATS). The decoder now synthesizes a correct `size_sum` from header slot data when the on-disk global is zeroed, preventing a panic in `allsequences_to_disk`.
+
+### FFI (sd1ffi)
+
+- `sd1_disk_to_thirty_sequences`: decode on-disk ThirtySequences to AllSequences SysEx payload
+- `sd1_thirty_sequences_to_disk`: encode AllSequences SysEx payload to on-disk ThirtySequences format
+
+### Testing
+
+- 134 unit/integration tests, all passing
+- New `scripts/verify-roundtrip.sh`: round-trips every SysEx-capable file on a disk image (extract → write to blank disk → extract → byte-compare); 36/36 pass on the reference disk
+
+## v1.3 — sd1ffi file-type constants
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+- `SD1_FILE_*` constants added to the `sd1ffi` C header, with C++ usage examples.
+- Unit tests for `sd1_int0_programs` and `sd1_rom_all_programs`.
+
+## v1.2 — sd1ffi: C API for the disk library
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+- New **`sd1ffi`** crate exposing the `sd1disk` library through a C FFI, with non-prefixed typedef aliases and C/C++ smoke tests.
+- Release workflow now packages the `sd1ffi` static library and header alongside `sd1cli`.
+- README: pre-built binary downloads and macOS `xattr` instructions.
+
+## v1.1.1 — Release automation
+
+_Reconstructed 2026-11-03 from the commit history; the GitHub release had no notes._
+
+- GitHub Actions release workflow builds cross-platform binaries on tag push (macOS x86_64 via `macos-latest`, Node.js 24 for Actions).
+- Updated the list of filename characters the SD-1 can enter.
+
+## v1.1 — "unified front"
+
+Version 1.1 integrates the last function that was still written in Python into the Rust code
+
+ - Adds the dump_programs command, a port of a Python debugging script that's useful to take a peek at 60 sequence/program files: shows all 60 programs embedded in a `SixtySequences+Programs` disk file, and decodes the track-program assignments for the first three defined sequences.
+
+## v1.0 — "blank slate"
+
+This is the first release of the code. Should work on MacOS and Linux; may need tweaks for Windows.
