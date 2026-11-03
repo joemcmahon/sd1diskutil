@@ -1,10 +1,17 @@
-## v1.19 — Recovery extractor: ThirtySequences, embedded programs, fragmented files
+## v1.19 — ThirtySequences round-trip; recovery extractor: ThirtySequences, embedded programs, fragmented files
 
-### Features
+### sd1cli: ThirtySequences round trip
+
+- **Bug:** `sd1cli extract` followed by `sd1cli write` turned a ThirtySequences file into SixtySequences (e.g. ROCK-BEATS: 35 → 46 blocks). AllSequences SysEx doesn't record which file type it came from, and `extract` emits the hardware-compatible 60-slot format for both, so v1.18's size check (short payload ⇒ ThirtySequences) never fired. The type can't be inferred from content either: all five SixtySequences files on the factory Sequencer OS disk use only slots 0–29.
+- **New `sd1cli write --as auto|thirty|sixty`.** `--as thirty` writes the SysEx as a ThirtySequences file (refused if any of slots 30–59 is defined); `--as sixty` forces SixtySequences; `auto` (the default) behaves as before.
+- **`sd1cli extract`** now prints a hint when the source is a ThirtySequences file, showing the `--as thirty` command to write it back.
+- Note: AllSequences SysEx doesn't carry programs, so a ThirtySequences file with embedded programs (e.g. 30-GROOVES) comes back without them.
+
+### Recovery extractor features
 
 - **`tools/extract_intact_sequences.py`** now extracts intact sequences from **ThirtySequences** files as well as SixtySequences.
 
-### Bug fixes
+### Recovery extractor bug fixes
 
 - **Embedded programs:** SixtySequences files with programs embedded (directory `type_info` bit `0x20`) keep their event data at byte 44032, not 11776. The extractor always read from 11776, so for these files it wrapped program data as sequences, and `sd1cli write` accepted them without complaint. **Any `.syx` previously extracted from such a file with this tool is wrong and should be re-extracted.**
 - **Fragmented files:** the extractor read files as one contiguous run from `first_block`. It now takes the first `contiguous_blocks` from the directory entry and follows the FAT chain for the rest. Blocks the chain can't account for (unrecovered FAT block, corrupt entry) are treated as unrecoverable rather than guessed.
@@ -15,7 +22,7 @@
 - Verified byte-for-byte against `sd1cli extract` on all 11 sequence files of the factory Sequencer OS v4.10 disk: 164/164 sequences (previously 49 wrong, 14 missing).
 - `ascension.img` SEQ-ASCESEQ (embedded programs): 20/20; MUZAK3 `ALEX 96` output unchanged.
 - Damage tests: unrecovered FAT block under a fragmented file yields no output (never wrong output); a zeroed data block skips only the affected slot.
-- 161 Rust tests, all passing (sd1disk: 120, sd1cli: 11, sd1ffi: 30).
+- 165 Rust tests, all passing (sd1disk: 120 + 11 integration, sd1ffi: 30, sd1cli: 4 new: `--as thirty` round trip of ROCK-BEATS is byte-identical, default unchanged, slots 30–59 refusal, extract hint).
 
 ## v1.18 — ThirtySequences: zeroed global section and CLI write dispatch
 

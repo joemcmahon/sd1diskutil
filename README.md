@@ -187,7 +187,7 @@ FAT: 1569 free, 8 used, 0 bad
 ### write
 
 ```
-sd1cli write <IMAGE> <SYSEX> [--name <NAME>] [--dir <1-4>] [--overwrite]
+sd1cli write <IMAGE> <SYSEX> [--name <NAME>] [--dir <1-4>] [--overwrite] [--as auto|thirty|sixty]
 ```
 
 Writes a SysEx file into a disk image. The SysEx message must be one of:
@@ -198,6 +198,7 @@ Writes a SysEx file into a disk image. The SysEx message must be one of:
 | `--name NAME` | SysEx filename stem | Override the name stored on disk (max 11 characters, A–Z 0–9 space) |
 | `--dir 1-4` | First directory with free space | Target sub-directory (1–4) |
 | `--overwrite` | off | Replace existing file with the same name |
+| `--as auto\|thirty\|sixty` | `auto` | File type for `AllSequences` SysEx. The SysEx doesn't record whether it came from a ThirtySequences or SixtySequences file (`extract` emits the 60-slot format for both), so `auto` writes 60-slot payloads as SixtySequences. Use `--as thirty` to write a ThirtySequences file back as one (refused if any of slots 30–59 is defined). |
 
 **Examples:**
 
@@ -213,6 +214,10 @@ sd1cli write sounds.img mypatch.syx --dir 2
 
 # Overwrite an existing file
 sd1cli write sounds.img mypatch.syx --overwrite
+
+# Round-trip a ThirtySequences file (extract prints this hint for them)
+sd1cli extract source.img ROCK-BEATS
+sd1cli write sounds.img ROCK-BEATS.syx --as thirty
 ```
 
 ---
