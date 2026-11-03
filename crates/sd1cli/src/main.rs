@@ -115,6 +115,9 @@ channel embedded in the SysEx header (default 0, i.e. channel 1).")]
         /// MIDI channel to embed in the SysEx header (0 = channel 1)
         #[arg(long, default_value = "0", help = "MIDI channel (0–15, default 0)")]
         channel: u8,
+        /// Sequence files only: omit embedded programs (pre-v1.19 output, AllSequences only)
+        #[arg(long, help = "Omit embedded programs from sequence files (pre-v1.19 output)")]
+        no_programs: bool,
     },
     /// Delete a file from a disk image
     #[command(long_about = "\
@@ -220,8 +223,8 @@ fn run(cli: Cli) -> sd1disk::Result<()> {
         Command::Inspect { image } => cmd_inspect(&image),
         Command::Write { image, sysex, name, dir, overwrite, seq_as } =>
             cmd_write(&image, &sysex, name.as_deref(), dir, overwrite, seq_as),
-        Command::Extract { image, name, out, channel } =>
-            cmd_extract(&image, &name, out.as_deref(), channel),
+        Command::Extract { image, name, out, channel, no_programs } =>
+            cmd_extract(&image, &name, out.as_deref(), channel, !no_programs),
         Command::Delete { image, name } => cmd_delete(&image, &name),
         Command::Create { image } => cmd_create(&image),
         Command::HfeToImg { hfe, img } => cmd_hfe_to_img(&hfe, &img),
@@ -510,6 +513,7 @@ fn cmd_extract(
     name: &str,
     out_path: Option<&Path>,
     channel: u8,
+    include_programs: bool,
 ) -> sd1disk::Result<()> {
     let img = DiskImage::open(image_path)?;
 
@@ -541,7 +545,13 @@ fn cmd_extract(
 
     // Sequence files can carry 60 embedded programs; emit them as an AllPrograms
     // packet ahead of AllSequences (write re-embeds them when both are present).
-    let programs_sysex = match embedded_programs(&raw, &entry.file_type, entry.type_info)? {
+    // --no-programs keeps the pre-v1.19 output (AllSequences only).
+    let found = if include_programs {
+        embedded_programs(&raw, &entry.file_type, entry.type_info)?
+    } else {
+        None
+    };
+    let programs_sysex = match found {
         Some(payload) => sd1disk::sysex::SysExPacket {
             message_type: sd1disk::MessageType::AllPrograms,
             midi_channel: channel,
@@ -947,7 +957,7 @@ mod tests {
             "written file should be the same size as the original ThirtySequences file");
         // extract -> write --as thirty -> extract gives back identical SysEx
         let out = img_path.with_file_name("again.syx");
-        cmd_extract(&img_path, "RT", Some(&out), 0).unwrap();
+        cmd_extract(&img_path, "RT", Some(&out), 0, true).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&syx).unwrap());
     }
 
@@ -1008,7 +1018,7 @@ mod tests {
         let src = factory_disk().unwrap();
         let dir = scratch(tag);
         let syx = dir.join("x.syx");
-        cmd_extract(&src, name, Some(&syx), 0).unwrap();
+        cmd_extract(&src, name, Some(&syx), 0, true).unwrap();
         let img_path = dir.join("t.img");
         cmd_create(&img_path).unwrap();
         cmd_write(&img_path, &syx, Some("RT"), None, false, seq_as).unwrap();
@@ -1022,13 +1032,23 @@ mod tests {
         let Some(src) = factory_disk() else { return };
         let dir = scratch("x60");
         let syx = dir.join("x.syx");
-        cmd_extract(&src, " COUNTRY-*", Some(&syx), 0).unwrap();
+        cmd_extract(&src, " COUNTRY-*", Some(&syx), 0, true).unwrap();
         let (entry, raw) = raw_file(&src, " COUNTRY-*");
         assert_ne!(entry.type_info & 0x20, 0, "fixture should have programs embedded");
         let pk = packets(&syx);
         let kinds: Vec<_> = pk.iter().map(|p| p.message_type.clone()).collect();
         assert_eq!(kinds, vec![MessageType::AllPrograms, MessageType::AllSequences]);
         assert_eq!(pk[0].payload, deinterleave_sixty_programs(&raw[11776..43576]).unwrap());
+    }
+
+    #[test]
+    fn extract_no_programs_keeps_pre_v1_19_single_packet_output() {
+        let Some(src) = factory_disk() else { return };
+        let dir = scratch("nop");
+        let syx = dir.join("x.syx");
+        cmd_extract(&src, " COUNTRY-*", Some(&syx), 0, false).unwrap();
+        let kinds: Vec<_> = packets(&syx).iter().map(|p| p.message_type.clone()).collect();
+        assert_eq!(kinds, vec![MessageType::AllSequences]);
     }
 
     #[test]

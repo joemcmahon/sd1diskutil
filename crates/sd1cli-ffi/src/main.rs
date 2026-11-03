@@ -122,6 +122,9 @@ enum Command {
         output: Option<PathBuf>,
         #[arg(short, long, default_value = "0")]
         channel: u8,
+        /// Sequence files only: omit embedded programs (pre-v1.19 output)
+        #[arg(long)]
+        no_programs: bool,
     },
 
     /// Write a SysEx file to disk image
@@ -178,7 +181,7 @@ fn cmd_list(image_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_extract(image_path: &Path, name: &str, out_path: Option<&Path>, channel: u8) -> Result<(), String> {
+fn cmd_extract(image_path: &Path, name: &str, out_path: Option<&Path>, channel: u8, include_programs: bool) -> Result<(), String> {
     let path   = path_cstr(image_path);
     let name_c = cstr(name);
 
@@ -206,7 +209,7 @@ fn cmd_extract(image_path: &Path, name: &str, out_path: Option<&Path>, channel: 
 
     // Sequence files can carry 60 embedded programs (type_info bit 0x20); emit them as
     // an AllPrograms packet ahead of AllSequences, matching sd1cli.
-    let programs_sysex: Vec<u8> = if matches!(entry.file_type, SD1_FILE_THIRTY_SEQUENCES | SD1_FILE_SIXTY_SEQUENCES) {
+    let programs_sysex: Vec<u8> = if include_programs && matches!(entry.file_type, SD1_FILE_THIRTY_SEQUENCES | SD1_FILE_SIXTY_SEQUENCES) {
         let mut pp: *mut u8 = ptr::null_mut();
         let mut pl: usize = 0;
         let rc = sd1_embedded_programs(raw_ptr, raw_len, entry.file_type, entry.type_info, &mut pp, &mut pl);
@@ -534,7 +537,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::List   { image }                           => cmd_list(&image),
-        Command::Extract { image, name, output, channel }  => cmd_extract(&image, &name, output.as_deref(), channel),
+        Command::Extract { image, name, output, channel, no_programs } => cmd_extract(&image, &name, output.as_deref(), channel, !no_programs),
         Command::Write  { image, sysex, name, overwrite }  => cmd_write(&image, &sysex, name.as_deref(), overwrite),
         Command::Delete { image, name }                     => cmd_delete(&image, &name),
         Command::Create { image }                           => cmd_create(&image),
