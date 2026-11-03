@@ -1166,6 +1166,44 @@ pub fn decode_b10(b10: u8, disk_programs: Option<&[String]>) -> String {
     }
 }
 
+/// The 60 programs embedded in a ThirtySequences or SixtySequences file, as an
+/// AllPrograms SysEx payload (60 × 530 bytes, program order), or `None` when the
+/// directory entry's `type_info` lacks bit 0x20 or the type can't carry programs.
+///
+/// SixtySequences store the programs at [11776..43576), before the sequence data;
+/// ThirtySequences store them right after the block-padded sequence data (walked the
+/// same way as `disk_to_thirty_sequences`). Real hardware sets bit 0x20 on both.
+pub fn embedded_programs(raw: &[u8], file_type: &FileType, type_info: u8) -> Result<Option<Vec<u8>>> {
+    const PROGRAMS_LEN: usize = SIXTY_PROGRAMS_COUNT * PROGRAM_SIZE; // 31800
+    const HEADER: usize = 188;
+    const BLOCK: usize = 512;
+    if type_info & 0x20 == 0 {
+        return Ok(None);
+    }
+    let start = match file_type {
+        FileType::SixtySequences => 11776,
+        FileType::ThirtySequences => {
+            if raw.len() < 30 * HEADER {
+                return Err(Error::InvalidSysEx("ThirtySequences data too short for headers"));
+            }
+            let mut pos = 6144;
+            for slot in 0..30 {
+                let h = &raw[slot * HEADER..(slot + 1) * HEADER];
+                if h[0] == 0xFF { continue; }
+                let ds = u32::from_be_bytes([0, h[183], h[184], h[185]]) as usize;
+                if ds == 0 || ds == 0xFF_FFFF { continue; } // undefined / stale (see v1.14)
+                pos += ds.div_ceil(BLOCK) * BLOCK;
+            }
+            pos
+        }
+        _ => return Ok(None),
+    };
+    if raw.len() < start + PROGRAMS_LEN {
+        return Err(Error::InvalidSysEx("embedded-programs flag set but file too short for 60 programs"));
+    }
+    deinterleave_sixty_programs(&raw[start..start + PROGRAMS_LEN]).map(Some)
+}
+
 /// Reverse of `interleave_sixty_programs`: convert on-disk SixtyPrograms data back
 /// to the AllPrograms SysEx payload order (programs 0,1,2,...,59 in sequence).
 ///
@@ -2263,5 +2301,38 @@ mod tests {
             assert_eq!(orig_hdr, rt_hdr,
                 "{}: header mismatch at slot {}", path, slot);
         }
+    }
+
+    // ---- embedded_programs ----
+
+    #[test]
+    fn embedded_programs_none_without_flag() {
+        let raw = vec![0u8; 50_000];
+        assert_eq!(embedded_programs(&raw, &FileType::SixtySequences, 0x00).unwrap(), None);
+        assert_eq!(embedded_programs(&raw, &FileType::OneProgram, 0x20).unwrap(), None);
+    }
+
+    #[test]
+    fn embedded_programs_sixty_reads_block_before_sequence_data() {
+        let mut raw = vec![0u8; 44032];
+        for (i, b) in raw[11776..43576].iter_mut().enumerate() { *b = (i % 251) as u8; }
+        let got = embedded_programs(&raw, &FileType::SixtySequences, 0x20).unwrap().unwrap();
+        assert_eq!(got, deinterleave_sixty_programs(&raw[11776..43576]).unwrap());
+    }
+
+    #[test]
+    fn embedded_programs_thirty_reads_block_after_sequence_data() {
+        // Real hardware file: 24 sequences, then 60 programs, then 456 bytes of residue.
+        let Ok(raw) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../30-GROOVES-real-disk.bin"))
+            else { return };
+        let start = raw.len() - (31800 + 456);
+        let got = embedded_programs(&raw, &FileType::ThirtySequences, 0x20).unwrap().unwrap();
+        assert_eq!(got, deinterleave_sixty_programs(&raw[start..start + 31800]).unwrap());
+    }
+
+    #[test]
+    fn embedded_programs_errors_when_flagged_file_is_too_short() {
+        let raw = vec![0u8; 20_000];
+        assert!(embedded_programs(&raw, &FileType::SixtySequences, 0x20).is_err());
     }
 }

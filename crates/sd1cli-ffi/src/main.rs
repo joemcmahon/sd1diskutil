@@ -20,7 +20,7 @@ use sd1ffi::{
     sd1_sequence_from_sysex, sd1_sequence_from_bytes, sd1_sequence_bytes,
     sd1_sequence_to_sysex, sd1_sequence_file_type, sd1_sequence_free,
     sd1_allsequences_to_disk, sd1_disk_to_allsequences, sd1_disk_to_thirty_sequences,
-    sd1_interleave_sixty_programs, sd1_deinterleave_sixty_programs,
+    sd1_interleave_sixty_programs, sd1_deinterleave_sixty_programs, sd1_embedded_programs,
     sd1_error_message,
 };
 use sd1disk::sysex::SysExPacket;
@@ -204,6 +204,24 @@ fn cmd_extract(image_path: &Path, name: &str, out_path: Option<&Path>, channel: 
         return Err(format!("extract failed: {}", err_msg(rc)));
     }
 
+    // Sequence files can carry 60 embedded programs (type_info bit 0x20); emit them as
+    // an AllPrograms packet ahead of AllSequences, matching sd1cli.
+    let programs_sysex: Vec<u8> = if matches!(entry.file_type, SD1_FILE_THIRTY_SEQUENCES | SD1_FILE_SIXTY_SEQUENCES) {
+        let mut pp: *mut u8 = ptr::null_mut();
+        let mut pl: usize = 0;
+        let rc = sd1_embedded_programs(raw_ptr, raw_len, entry.file_type, entry.type_info, &mut pp, &mut pl);
+        if rc != 0 {
+            sd1_bytes_free(raw_ptr, raw_len);
+            return Err(format!("embedded programs failed: {}", err_msg(rc)));
+        }
+        if pp.is_null() { Vec::new() } else {
+            let payload = unsafe { std::slice::from_raw_parts(pp, pl) };
+            let out = wrap_sysex(channel, MSG_ALL_PROGRAMS, payload);
+            sd1_bytes_free(pp, pl);
+            out
+        }
+    } else { Vec::new() };
+
     let sysex_bytes: Vec<u8> = match entry.file_type {
         SD1_FILE_ONE_PROGRAM => {
             let prog = sd1_program_from_bytes(raw_ptr, raw_len, ptr::null_mut());
@@ -292,6 +310,7 @@ fn cmd_extract(image_path: &Path, name: &str, out_path: Option<&Path>, channel: 
 
     let dest = out_path.map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(format!("{}.syx", name)));
+    let sysex_bytes = [programs_sysex, sysex_bytes].concat();
     std::fs::write(&dest, &sysex_bytes).map_err(|e| e.to_string())?;
     println!("Extracted: {} -> {}", name, dest.display());
     Ok(())
