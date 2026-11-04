@@ -21,3 +21,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Round-trip every file on the reference disk
+      run: ./scripts/verify-roundtrip.sh disk_with_everything.img
+    - name: Check the recovery extractor against sd1cli
+      run: python3 scripts/verify-extractor.py disk_with_everything.img
