@@ -3,7 +3,9 @@
 # Skips: SequencerOs, SixPrograms, ThirtyPrograms (no SysEx message type exists for these).
 #
 # Strategy: extract each file to SysEx, write it to a fresh blank disk, extract it back,
-# compare the two SysEx files byte-for-byte.
+# compare the two SysEx files byte-for-byte. Also check that the written file kept its type
+# and block count: SysEx alone can't show a ThirtySequences file turning into SixtySequences,
+# or embedded programs being dropped.
 #
 # Usage: ./scripts/verify-roundtrip.sh <disk.img>
 set -euo pipefail
@@ -56,9 +58,24 @@ while IFS= read -r line; do
 
     # Write to blank disk (truncate name to 8 chars + TST suffix to stay within 11)
     WNAME="${NAME:0:8}TST"
-    if ! "$CLI" write "$BLANK_DISK" "$SYX" --name "$WNAME" 2>&1; then
+    # SysEx doesn't record ThirtySequences vs SixtySequences, so say which one we want.
+    AS_ARGS=()
+    [ "$TYPE" = "ThirtySequences" ] && AS_ARGS=(--as thirty)
+    if ! "$CLI" write "$BLANK_DISK" "$SYX" --name "$WNAME" ${AS_ARGS[@]+"${AS_ARGS[@]}"} 2>&1; then
         printf "FAIL  %-12s  (%s) — write failed\n" "$NAME" "$TYPE"
         FAIL=$((FAIL+1))
+        continue
+    fi
+
+    # The written file must keep the original's type and size on disk.
+    BLOCKS="$(echo "$line" | cut -c37- | awk '{print $1}')"
+    WLINE="$("$CLI" list "$BLANK_DISK" | awk -v n="$WNAME" 'index($0, n)==1')"
+    WTYPE="$(echo "$WLINE" | cut -c14-35 | sed 's/[[:space:]]*$//')"
+    WBLOCKS="$(echo "$WLINE" | cut -c37- | awk '{print $1}')"
+    if [ "$WTYPE" != "$TYPE" ] || [ "$WBLOCKS" != "$BLOCKS" ]; then
+        printf "DIFF  %-12s  (%s, %s blocks) — written as %s, %s blocks\n" "$NAME" "$TYPE" "$BLOCKS" "$WTYPE" "$WBLOCKS"
+        FAIL=$((FAIL+1))
+        "$CLI" delete "$BLANK_DISK" "$WNAME" 2>/dev/null || true
         continue
     fi
 
